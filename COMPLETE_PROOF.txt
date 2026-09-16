@@ -1,0 +1,2380 @@
+===== GIT STATUS =====
+===== COMMIT =====
+db427b0 install: refuse an interpreter with no torch
+===== backend.py =====
+===== workspace.py: Torch-Auflösung =====
+15-this replaced was deleted with it.
+16-
+17-Also handles env stamping (ABI + version + torch pin), install-hash skip of
+18-unchanged envs, and the post-install libomp dedupe.
+19-"""
+20-
+21-from __future__ import annotations
+22-
+23-import re
+24-import hashlib
+25-import os
+26-import sys
+27-from pathlib import Path
+28-from typing import Any, Callable, Dict, List, Optional, Tuple
+29-
+30-from ..config import (
+31-    ComfyEnvConfig,
+32-    load_config,
+33-    CONFIG_FILE_NAME,
+34-)
+35-from ..environment.cache import get_env_name
+36-from .helpers import InstallLog, _log_subprocess, _run_pixi, _patch_uv_platform_py
+37-
+38-
+39-_PYTORCH_PACKAGES = {"torch", "torchvision", "torchaudio"}
+40-_INSTALL_HASH_FILE = "install.hash"
+41-
+42-
+43-# Bootstrap probing & node discovery
+44-
+45:def _resolve_workspace_torch(
+46-    log: Callable[[str], None],
+47-) -> Tuple[Optional[str], Optional[str], Optional[str], str, Optional[str]]:
+48-    """Decide (torch_index, cuda_version, cuda_major, python_version, torch_version)
+49-    once for the whole workspace.
+50-
+51-    `cuda_version` is the full string (e.g. "12.4"), used by `get_wheel_url`.
+52-    `cuda_major` is just the leading digit (e.g. "12"), used in `[system-requirements]`.
+53-    `python_version` is the bootstrap interpreter's MAJOR.MINOR (e.g. "3.10").
+54-    `torch_version` is the bootstrap's torch.__version__ (public part), or None
+55-    if torch isn't importable from bootstrap (then the comfyui feature stays
+56-    `torch = "*"` and the cuda-wheel picker reads the actual version from the
+57-    materialized template env post-install).
+58-
+59-    macOS: (None, None, None, py, torch) -- pixi falls through to default PyPI
+60-    which has osx-arm64/osx-64 torch wheels. Linux/Windows + NVIDIA: cu* index
+61-    + version. Linux/Windows without GPU: (cpu_index, None, None, py, torch).
+62-    """
+63-    from ..detection import (
+64-        get_recommended_cuda_version,
+65-        get_gpu_summary,
+66-        get_bootstrap_python_version,
+67-        get_bootstrap_torch_version,
+68-        get_bootstrap_torch_cuda,
+69-    )
+70-    cpu_index = "https://download.pytorch.org/whl/cpu"
+71-    python_version = get_bootstrap_python_version()
+72-    torch_version = get_bootstrap_torch_version()
+73-    bootstrap_cuda = get_bootstrap_torch_cuda()
+74-
+75-    # Portable ComfyUI ships torch+cu128 inside python_embeded, so bootstrap_cuda
+76-    # is "12.8" even on a hosted runner with no NVIDIA driver. Treat it as
+77-    # CPU-only when no GPU is actually present -- otherwise pixi installs cu*
+78-    # wheels into every env and `import torch` later dies with WinError 127
+79-    # (or its Linux equivalent) trying to load shm.dll / libtorch_cuda.so.
+80-    from ..detection.cuda import has_nvidia_gpu
+81-    if bootstrap_cuda and not has_nvidia_gpu():
+82-        log(
+83-            f"[comfy-env] Bootstrap torch is cu{bootstrap_cuda.replace('.', '')[:3]} "
+84-            f"but no NVIDIA GPU detected -- ignoring cuda tag, using CPU index"
+85-        )
+86-        bootstrap_cuda = None
+87-
+88-    cu_tag_bootstrap = (
+89-        f"cu{bootstrap_cuda.replace('.', '')}" if bootstrap_cuda else "cpu"
+90-    )
+91-    py_short = python_version.replace(".", "") if python_version else "?"
+92-    if torch_version:
+93-        log(
+94-            f"[comfy-env] Bootstrap interpreter has python {python_version} + "
+95-            f"torch {torch_version} ({cu_tag_bootstrap}). Looking for cuda-only "
+96-            f"wheels matching {cu_tag_bootstrap}/torch{torch_version.rsplit('.', 1)[0]}/cp{py_short}."
+97-        )
+98-    else:
+99-        # A Python with no torch is not a ComfyUI's: ComfyUI imports torch
+100-        # unconditionally, and a CPU-only ComfyUI still has a CPU torch. So
+101-        # this can only mean install.py was run with some other interpreter.
+102-        # An env built from it is keyed `py3XX-notorch` and stamped for a host
+103-        # that has no torch, which no real host ever is, so nothing can bind
+104-        # it -- a gigabyte of the wrong torch in a directory nothing will use.
+105-        # Refuse here, before any disk is touched, and say what to run.
+106-        raise RuntimeError(
+107-            f"[comfy-env] The interpreter running this install (python "
+108-            f"{python_version}, {sys.executable}) has no torch, so it is not a "
+109-            f"ComfyUI's. Envs are keyed on the ComfyUI interpreter's python, "
+110-            f"torch and CUDA, and one built without them can never be bound. "
+111-            f"Run install.py with the python that runs ComfyUI's main.py."
+112-        )
+113-
+114-    if sys.platform == "darwin":
+115-        # PyTorch's `/whl/cpu/` index is Linux+Windows-only — there are no
+116-        # osx-arm64 / osx-64 wheels there. macOS torch lives on regular PyPI
+117-        # (the wheel is implicitly CPU-only since there's no CUDA on Apple
+118-        # Silicon). Returning None for torch_index lets pixi resolve from the
+119-        # default PyPI index instead of erroring "no matching platform tag".
+120-        return None, None, None, python_version, torch_version
+121-
+122-    log(f"[comfy-env] GPU: {get_gpu_summary()}")
+123-    cuda_version = bootstrap_cuda or get_recommended_cuda_version()
+124-    if not cuda_version:
+125-        log("[comfy-env] No CUDA detected -- pinning comfyui torch to CPU index")
+126-        return cpu_index, None, None, python_version, torch_version
+127-
+128-    cu_tag = "cu" + cuda_version.replace(".", "")[:3]
+129-    torch_index = f"https://download.pytorch.org/whl/{cu_tag}"
+130-    cuda_major = cuda_version.split(".")[0]
+131-    src = "bootstrap torch" if bootstrap_cuda else "GPU driver"
+132-    log(
+133-        f"[comfy-env] Comfyui feature -> torch {torch_version or '*'} from "
+134-        f"{torch_index} (CUDA {cuda_version} via {src})"
+135-    )
+136-    return torch_index, cuda_version, cuda_major, python_version, torch_version
+137-
+138-
+139-def _bindable_config_paths(plugin_dir: Path) -> List[Path]:
+140-    """The ONLY locations the runtime binder supports: `nodes/comfy-env.toml`
+141-    and `nodes/<subdir>/comfy-env.toml` (isolation/wrap.py pattern 1 and 2).
+142-
+143-    Discovery enumerates exactly these shapes -- deliberately NOT a recursive
+144-    glob. A config anywhere else (pack root, deeper nesting, vendored trees)
+145-    could be materialized but never bound, silently wasting gigabytes; by
+146-    matching discovery to binding, that whole class cannot occur.
+147-    """
+148-    nodes_dir = plugin_dir / "nodes"
+149-    if not nodes_dir.is_dir():
+150-        return []
+151-    out = []
+152-    root_cf = nodes_dir / CONFIG_FILE_NAME
+153-    if root_cf.is_file():
+154-        out.append(root_cf)
+155-    for child in sorted(nodes_dir.iterdir()):
+156-        if child.is_dir() and not child.name.startswith((".", "_")):
+157-            cf = child / CONFIG_FILE_NAME
+158-            if cf.is_file():
+159-                out.append(cf)
+160-    return out
+161-
+162-
+163-def _discover_node_configs(
+164-    comfyui_dir: Path,
+165-    log: Callable[[str], None] = print,
+166-    failures: Optional[List[Tuple[Path, Exception]]] = None,
+167-) -> List[Tuple[str, Path, Path, ComfyEnvConfig]]:
+168-    """Find bindable comfy-env.toml configs under custom_nodes/ and pair
+169-    with (env_name, plugin_dir, config_path, cfg).
+170-
+171-    Only the shapes the runtime can bind are discovered (see
+172-    `_bindable_config_paths`). Duplicate env names across configs are a
+173-    hard error: proceeding would make both configs share one env dir and
+174-    overwrite each other's install hash -- a permanent multi-GB rebuild
+175-    loop with no diagnostic (the 2026-08 review's collision-thrash defect).
+176-
+177-    Logs the scan loudly so failed parses don't silently produce an empty result.
+178-
+179-    A config that does not parse is SKIPPED, not fatal: this sweep covers
+180-    every pack on the machine, and one pack's typo must not abort another
+181-    pack's install (the per-env isolation rule -- see ADR-0007). The
+182-    calling pack's OWN config is loaded unwrapped by `install()`, so an
+183-    author's own mistake still hard-errors where they can see it. Skipped
+184-    configs are appended to `failures` (when provided) so the caller can
+185-    report them instead of finishing with a silent success.
+186-    """
+187-    custom_nodes = comfyui_dir / "custom_nodes"
+188-    if not custom_nodes.is_dir():
+189-        log(f"[comfy-env] _discover: {custom_nodes} is not a directory")
+190-        return []
+191-
+192-    log("")
+193-    log(f"[comfy-env] _discover: scanning {custom_nodes}")
+194-    out: List[Tuple[str, Path, Path, ComfyEnvConfig]] = []
+195-    seen: Dict[str, Path] = {}
+196-    for plugin_dir in sorted(custom_nodes.iterdir()):
+197-        if not plugin_dir.is_dir():
+198-            continue
+199-        if plugin_dir.name.startswith((".", "_")):
+200-            log(f"[comfy-env] _discover: skip {plugin_dir.name} (dot/underscore prefix)")
+201-            continue
+202-        # Quarantine suffix used by _node_guard and other "disable this node
+203-        # without deleting it" tools. Skip so we don't materialize a pixi env
+204-        # for a node that isn't even being loaded by ComfyUI.
+205-        if plugin_dir.name.endswith((".disabled", "._disabled")):
+206-            log(f"[comfy-env] _discover: skip {plugin_dir.name} (quarantine suffix)")
+207-            continue
+208-        toml_files = _bindable_config_paths(plugin_dir)
+209-        if not toml_files:
+210-            log(f"[comfy-env] _discover: {plugin_dir.name}: no bindable {CONFIG_FILE_NAME}")
+211-            continue
+212-        for cf in toml_files:
+213-            try:
+214-                cfg = load_config(cf)
+215-            except (ValueError, OSError) as e:
+216-                # Data errors only (ValueError covers TOMLDecodeError and
+217-                # every schema rejection). Anything else -- AttributeError,
+218-                # KeyError, TypeError -- is a bug in the config layer, not a
+219-                # bad file, and must propagate instead of being relabelled
+220-                # as the user's fault.
+221-                log(
+222-                    f"[comfy-env] WARNING: skipping {cf} -- "
+223-                    f"{type(e).__name__}: {e}"
+224-                )
+225-                log(
+===== workspace.py: Wheel-Auflösung =====
+===== toml_generator.py: Torch/CPU/Index =====
+16-from pathlib import Path
+17-from typing import Any, Callable, Dict, Iterable, List, Optional
+18-
+19-from ..config import ComfyEnvConfig
+20-from ..detection import get_pixi_platform
+21-
+22-
+23-_TORCH_PKGS = {"torch", "torchvision", "torchaudio"}
+24-
+25-
+26-def _require_tomli_w():
+27-    try:
+28-        import tomli_w
+29-        return tomli_w
+30-    except ImportError:
+31-        raise ImportError("tomli-w required: pip install tomli-w")
+32-
+33-
+34-# requirements.txt parsing
+35-
+36-
+37-def _common_base_dependencies(version: str) -> Dict[str, Any]:
+38-    """Conda deps every env needs: python pin + pip + setuptools."""
+39-    return {
+40-        "python": f"{version}.*",
+41-        "pip": "*",
+42-        "setuptools": ">=75.0,<82",
+43-    }
+44-
+45-
+46:def _torch_family_pypi(
+47-    torch_pin: Optional[str],
+48-    torch_index: Optional[str],
+49-    log: Callable[[str], None],
+50-) -> Dict[str, Any]:
+51-    """Build `{torch, torchvision, torchaudio}` pypi-deps, optionally with `index` attached.
+52-
+53-    Replicated verbatim into every feature so each env resolves identical torch
+54-    files and pixi's content-addressable cache hardlink-shares them. When
+55-    `torch_index` is set (Linux/Windows + CUDA path), the index is attached to
+56-    every entry. When it's None (macOS, where the PyTorch /whl/cpu index has no
+57-    osx-arm64 wheels), the pin is emitted without an index so pixi resolves
+58-    from the default PyPI. `_torch_family_pins` already returns a partial map
+59-    `{"torch": pin}` when the family table doesn't know `torch.minor` yet --
+60-    that's the right behavior for torch 2.12-style "ahead of family" cases
+61-    where torchaudio hasn't shipped yet.
+62-    """
+63-    if not torch_pin:
+64-        return {}
+65-    pin_map = _torch_family_pins(torch_pin, log)
+66-    if not pin_map:
+67-        return {}
+68-    if torch_index:
+69-        return {pkg: {"version": pin, "index": torch_index}
+70-                for pkg, pin in pin_map.items()}
+71-    return dict(pin_map)
+72-
+73-
+74-#: Packages whose version is derived from the host ComfyUI rather than authored
+75-#: here. Same rule as the torch family: comfy-env replicates a pin it reads, it
+76-#: never invents one. comfy-aimdo ships weekly and ComfyUI pins it exactly, so a
+77-#: literal in this repository would be stale within the month.
+78-_HOST_DERIVED_PKGS = ("comfy-aimdo", "comfy-kitchen")
+79-
+80-#: Of those, the ones that only make sense on a CUDA stack. comfy-aimdo has
+81-#: no CPU path (``_vbar_get`` returns None for a CPU load device and
+82-#: MAX_PINNED_MEMORY stays -1), so injecting it into a CPU env is dead
+83-#: weight. comfy-kitchen is NOT in this set: the host's ComfyUI imports it
+84-#: unguarded from four modules on the ``comfy.model_patcher`` import chain
+85-#: (comfy/ldm/modules/attention.py:13, ldm/joyimage/model.py:5,
+86-#: ldm/lightricks/vae/na_diffusion_decoder.py:30, text_encoders/llama.py:8),
+87-#: so ANY worker that imports comfy needs it, CPU included. Four of nineteen
+88-#: worker envs on the development machine could not import
+89-#: comfy.model_patcher at all for exactly this reason.
+90-_HOST_CUDA_ONLY_PKGS = frozenset({"comfy-aimdo"})
+91-
+92-
+93-def read_host_pin(comfyui_dir: Optional[Path], package: str) -> Optional[str]:
+94-    """Read an exact ``==`` pin for `package` out of the host ComfyUI's requirements.
+95-
+96-    Returns None when the file, or the pin, is absent. Never raises: a worker
+97-    env that cannot resolve the host's pin is built without the package, which
+98-    is exactly today's behaviour.
+99-    """
+100-    # Prefer the INSTALLED distribution in the environment running this
+101-    # install, which is the host env: the worker's skew guard compares against
+102-    # the parent's installed wheel (importlib.metadata), so pinning from the
+103-    # requirements file while the venv lags it would make every worker refuse
+104-    # aimdo, silently and permanently. One source of truth, the running host.
+105-    try:
+106-        from importlib.metadata import PackageNotFoundError, version
+107-
+108-        return version(package)
+109-    except PackageNotFoundError:
+110-        pass
+111-    except Exception:
+112-        pass
+113-    if comfyui_dir is None:
+114-        return None
+115-    req = Path(comfyui_dir) / "requirements.txt"
+116-    try:
+117-        text = req.read_text(encoding="utf-8", errors="replace")
+118-    except OSError:
+119-        return None
+120-    # Build the alternation explicitly: relying on whether re.escape() escapes
+121-    # "-" is version dependent behaviour to hang a parser on.
+122-    stem = "[-_]".join(re.escape(part) for part in package.split("-"))
+123-    pattern = re.compile(
+124-        r"^\s*" + stem + r"\s*==\s*([^\s#;]+)", re.IGNORECASE | re.MULTILINE
+125-    )
+126-    match = pattern.search(text)
+127-    return match.group(1) if match else None
+128-
+129-
+130-def _canonical(name: str) -> str:
+131-    """PEP 503 name normalisation: lowercase, any run of -_. becomes a hyphen."""
+132-    return re.sub(r"[-_.]+", "-", name).lower()
+133-
+134-
+135-def _declared_spec(value: Any) -> Optional[str]:
+136-    """The version spec a pixi pypi entry carries, string or table form."""
+137-    if isinstance(value, str):
+138-        return value
+139-    if isinstance(value, dict):
+140-        got = value.get("version")
+141-        return got if isinstance(got, str) else None
+142-    return None
+143-
+144-
+145-def _replace_host_derived(
+146-    node_pypi: Dict[str, Any],
+--
+188-            if canon in canon_derived:
+189-                node_pypi.pop(key)
+190-                log(
+191-                    f"[pixi] {label} {name}: dropping `{key}` (no host pin to "
+192-                    f"replicate, and this is not a pack's version to choose); "
+193-                    f"the solver picks"
+194-                )
+195-            continue
+196-        pkg, wanted = match
+197-        declared = node_pypi.pop(key)
+198-        spec = _declared_spec(declared)
+199-        if spec and spec.startswith("==") and spec != wanted:
+200-            raise ValueError(
+201-                f"[{name}] comfy-env.toml pins {key}{spec} in {label}, but the "
+202-                f"host ComfyUI pins {wanted}. A worker and its host must agree "
+203-                f"on this package. Remove the pin and comfy-env will replicate "
+204-                f"the host's."
+205-            )
+206-        out[pkg] = wanted
+207-        log(f"[{name}] {label} {key}={spec or declared!r} replaced by the host's {wanted}")
+208-    return out
+209-
+210-
+211-def _host_derived_pypi(
+212-    comfyui_dir: Optional[Path],
+213-    enabled: bool,
+214-    log: Callable[[str], None],
+215-) -> Dict[str, Any]:
+216-    """Pins replicated from the host ComfyUI, when the caller opted in.
+217-
+218:    On by default, for the same reason `_torch_family_pypi` is: an ABI sensitive
+219-    native wheel straddling a process boundary is not a per user preference.
+220-    Packs ship the identical boilerplate `comfy-aimdo = "*"`, pixi resolves that
+221-    wildcard on whatever day the env was built, and the result drifts off the
+222-    host. That has already happened: a worker env here holds 0.4.14 against a
+223-    host pinned to 0.4.13.
+224-
+225-    Replicating rather than authoring is the whole rule. When the host declares
+226-    no pin, this returns nothing and the pack's own spec stands, which is the
+227-    behaviour before this existed.
+228-    """
+229-    if not enabled:
+230-        return {}
+231-    out: Dict[str, Any] = {}
+232-    for pkg in _HOST_DERIVED_PKGS:
+233-        pin = read_host_pin(comfyui_dir, pkg)
+234-        if pin:
+235-            out[pkg] = f"=={pin}"
+236-            log(f"[pixi] replicating host pin {pkg}=={pin}")
+237-        else:
+238-            log(
+239-                f"[pixi] no `{pkg}==` pin in the host ComfyUI's requirements.txt; "
+240-                f"leaving whatever the pack declares. Parent and worker may "
+241-                f"resolve different versions."
+242-            )
+243-    return out
+244-
+245-
+246-def _validate_node_config(name: str, cfg: ComfyEnvConfig) -> None:
+247-    """Reject node configs that try to redefine the workspace torch pin."""
+248-    bad = [p for p in cfg.cuda_packages if p in _TORCH_PKGS]
+249-    if bad:
+250-        raise ValueError(
+251-            f"[{name}] comfy-env.toml has {bad} under [cuda] packages. "
+252-            "Plain torch/torchvision/torchaudio are pinned workspace-wide "
+253-            "(replicated into every feature so the rattler cache dedupes). "
+254-            "Remove them from [cuda] packages -- keep only CUDA-only wheels there "
+255-            "(cumesh, flash-attn, cc_torch, nvdiffrast, etc.)."
+256-        )
+257-
+258-
+259-def _strip_torch_family(
+260-    table: Dict[str, Any],
+261-    name: str,
+262-    where: str,
+263-    log: Callable[[str], None],
+264-) -> None:
+265-    """Remove plain torch/torchvision/torchaudio entries from a deps table in place.
+266-
+267-    Torch family is pinned workspace-wide and added directly to each feature by
+268-    `_build_node_feature`. Node-level declarations are stripped so they can't
+269-    shadow the pin.
+270-    """
+271-    for k in list(table.keys()):
+272-        if k.lower() in _TORCH_PKGS:
+273-            del table[k]
+274-            log(f"[comfy-env] {name}: ignoring `{k}` in {where} (pinned workspace-wide)")
+275-
+276-
+277-# ---------------------------------------------------------------------------
+278-# ADR-0013 passthrough contract: forward everything pixi owns; the sets below
+279-# are the ENTIRE schema knowledge comfy-env keeps about pixi's language.
+280-#
+281-# _HANDLED_PASSTHROUGH: tables the compiler already places/transforms itself
+282-#   (torch-family REWRITE inside dependencies/pypi-dependencies; [activation]
+283-#   MERGE; workspace.channels forwarding). Wire types declare in
+284-#   comfy-env-root.toml [types] (ADR-0015), not here.
+285-# _DENIED_PASSTHROUGH / _DENIED_WORKSPACE_KEYS: compiler-owned, hard error --
+286-#   the single-feature/single-env manifest shape IS ADR-0007, and platforms/
+287-#   name/version are host-derived identity.
+288-# Everything else is forwarded verbatim at the feature level; pixi (pinned,
+289-# ADR-0002) validates its own language.
+290-# ---------------------------------------------------------------------------
+291-_HANDLED_PASSTHROUGH = {
+292-    "dependencies", "pypi-dependencies", "target", "pypi-options",
+293-    "system-requirements", "activation", "workspace",
+294-}
+295-_DENIED_PASSTHROUGH = {"environments", "feature"}
+296-_DENIED_WORKSPACE_KEYS = {"name", "version", "platforms"}
+297-
+298-
+299-def _validate_passthrough(env_name: str, cfg: ComfyEnvConfig) -> None:
+300-    """Hard-error on compiler-owned keys (ADR-0013 deny list)."""
+301-    denied = sorted(_DENIED_PASSTHROUGH & set(cfg.pixi_passthrough))
+302-    if denied:
+303-        raise ValueError(
+304-            f"{env_name}: comfy-env.toml declares compiler-owned table(s) "
+305-            f"{', '.join('[' + d + ']' for d in denied)} -- the per-env "
+306-            f"manifest is single-feature/single-environment by design "
+307-            f"(ADR-0007); comfy-env generates these."
+308-        )
+309-    ws = cfg.pixi_passthrough.get("workspace", {})
+310-    ws_denied = sorted(_DENIED_WORKSPACE_KEYS & set(ws))
+311-    if ws_denied:
+312-        raise ValueError(
+313-            f"{env_name}: comfy-env.toml declares compiler-owned workspace "
+314-            f"key(s) {', '.join(ws_denied)} -- name/version are env identity "
+315-            f"and platforms is derived from the host machine."
+316-        )
+317-
+318-
+319-def _build_node_feature(
+320-    cfg: ComfyEnvConfig,
+321-    name: str,
+322-    version: str,
+323-    torch_pin: Optional[str],
+324-    torch_index: Optional[str],
+325-    glibc_version: Optional[str],
+326-    log: Callable[[str], None] = print,
+327-    macos_version: Optional[str] = None,
+328-    cuda_wheel_urls: Optional[Dict[str, str]] = None,
+329-    comfyui_dir: Optional[Path] = None,
+330-    host_derived: bool = True,
+331-) -> Dict[str, Any]:
+332-    """Emit a self-contained pixi `[feature.<name>.*]` block for one env.
+333-
+334-    Each node env owns its full feature: python pin, pip/setuptools, glibc,
+335-    KMP env var, torch family pin (replicated from workspace -- see
+336:    `_torch_family_pypi`), and the node's own deps from `comfy-env.toml`.
+337-    No base feature is composed in. Plain torch/torchvision/torchaudio entries
+338-    in the node's own deps are stripped so they can't shadow the workspace pin.
+339-
+340-    `pypi-options` from the node's `comfy-env.toml` is passed through verbatim,
+341-    so a node author can still express `[pypi-options.dependency-overrides]`
+342-    manually to redirect a specific transitive resolution.
+343-    """
+344-    feat: Dict[str, Any] = {}
+345-
+346-    # Conda deps: base (python/pip/setuptools) + node's own
+347-    deps = _common_base_dependencies(version)
+348-    node_conda = copy.deepcopy(cfg.pixi_passthrough.get("dependencies", {}))
+349-    if node_conda:
+350-        _strip_torch_family(node_conda, name, "[dependencies]", log)
+351-        deps.update(node_conda)
+352-    feat["dependencies"] = deps
+353-
+354-    # PyPI deps: torch family pin (replicated workspace-wide) + node's own
+355:    pypi = _torch_family_pypi(torch_pin, torch_index, log)
+356-    host_pins = _host_derived_pypi(comfyui_dir, host_derived, log)
+357-    # Empty when the operator turned replication off, so the strip below is a
+358-    # no-op then: opting out must leave a pack's own declarations standing.
+359-    _derived_names = _HOST_DERIVED_PKGS if host_derived else ()
+360-    node_pypi = copy.deepcopy(cfg.pixi_passthrough.get("pypi-dependencies", {}))
+361-    if node_pypi:
+362-        _strip_torch_family(node_pypi, name, "[pypi-dependencies]", log)
+363-        # Substitute in place, and ONLY where the pack already declares the
+364-        # package. Adding it to a pack that never asked would put a native CUDA
+365-        # wheel into CPU-only envs and change every env's identity, which is a
+366-        # far larger blast radius than the drift this exists to fix.
+367-        pypi.update(_replace_host_derived(node_pypi, host_pins, name,
+368-                                          log=log, derived=_derived_names))
+369-        pypi.update(node_pypi)
+370-    # Inject even when the pack never asked. These are not the pack's
+371-    # dependencies to declare: the HOST's ComfyUI imports them unguarded, so a
+372-    # worker that lacks one cannot import comfy at all, and a worker cannot be
+373-    # made transparent later without them. Absence is the expensive mistake.
+374-    # Only envs that have torch at all are candidates; within those, the
+375-    # CUDA-only set is skipped on a CPU stack.
+376-    if torch_pin:
+377-        _is_cpu = not torch_index or "cpu" in str(torch_index).lower()
+378-        for pkg, wanted in host_pins.items():
+379-            if _is_cpu and pkg in _HOST_CUDA_ONLY_PKGS:
+380-                continue
+381-            pypi.setdefault(pkg, wanted)
+382-    # CUDA wheels, inlined as direct-URL deps (may carry a #sha256= fragment,
+383-    # which pixi records in the lock and uv verifies). The wheels' in-farm
+384-    # METADATA declares no dependencies, so a URL dep is exactly the
+385-    # `--no-deps` semantics the retired post-pixi uv pass had -- but inside
+386-    # pixi.lock, hashed, cached, and safe against a plain `pixi install`.
+387-    # Merged LAST so neither the torch pin nor an author entry shadows it.
+388-    if cuda_wheel_urls:
+389-        for _pkg, _url in sorted(cuda_wheel_urls.items()):
+390-            _key = _pkg.lower().replace("_", "-")
+391-            pypi[_key] = {"url": _url}
+392-    if pypi:
+393-        feat["pypi-dependencies"] = pypi
+394-
+395-    # Per-target sections (only the current platform's), with torch family stripped
+396-    targets = cfg.pixi_passthrough.get("target", {})
+397-    current = get_pixi_platform()
+398-    if current in targets:
+399-        cur_target = copy.deepcopy(targets[current])
+400-        for tbl in ("dependencies", "pypi-dependencies"):
+401-            if tbl in cur_target:
+402-                _strip_torch_family(
+403-                    cur_target[tbl], name,
+404-                    f"[target.{current}.{tbl}]", log,
+405-                )
+406-                if tbl == "pypi-dependencies":
+407-                    # A target table wins over the feature table on its own
+408-                    # platform, so an unpinned aimdo left here would silently
+409-                    # beat the host pin we just substituted above.
+410-                    pypi.update(_replace_host_derived(
+411-                        cur_target[tbl], host_pins, name,
+412-                        f"[target.{current}.{tbl}]", log,
+413-                        derived=_derived_names,
+414-                    ))
+415-                if not cur_target[tbl]:
+416-                    del cur_target[tbl]
+417-        if cur_target:
+418-            feat.setdefault("target", {})[current] = cur_target
+419-    # The target loop can add host pin substitutes into `pypi` after the
+420-    # attachment above was skipped for being empty. Re-attach so a pack whose
+421-    # ONLY pypi declaration lives in [target.*] does not silently lose it.
+422-    if pypi and "pypi-dependencies" not in feat:
+423-        feat["pypi-dependencies"] = pypi
+424-
+425-    pypi_options = copy.deepcopy(cfg.pixi_passthrough.get("pypi-options", {}))
+426-    if pypi_options:
+427-        feat["pypi-options"] = pypi_options
+428-
+429-    # System requirements: node-declared wins outright; else auto-detect from
+430-    # host (glibc on Linux, torch's wheel macOS floor on macOS). Both may be
+431-    # set on the same platform if applicable.
+432-    # Author-declared [system-requirements] passes through verbatim (their
+433-    # choice of spelling; pixi 0.75 warns on the table but honours it). The
+434-    # AUTO-detected glibc/macos values no longer land here: pixi deprecated
+435-    # the table in favour of keys on the workspace `platforms` entry, so
+436-    # build_env_toml emits them there and this feature stays silent.
+437-    sys_reqs = cfg.pixi_passthrough.get("system-requirements")
+438-    if sys_reqs:
+439-        feat["system-requirements"] = copy.deepcopy(sys_reqs)
+440-
+441-    # [activation]: MERGE (ADR-0013) -- author entries pass through; the
+442-    # compiler's own key wins only on direct collision. Assigning the block
+443-    # outright silently clobbers author activation.
+444-    activation = copy.deepcopy(cfg.pixi_passthrough.get("activation", {}))
+445-    if not isinstance(activation, dict):
+446-        activation = {}
+447-    act_env = activation.setdefault("env", {})
+448-    act_env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+449-    feat["activation"] = activation
+450-
+451-    # Honest passthrough (ADR-0013): every remaining table is forwarded
+452-    # verbatim at the feature level ([tasks], future pixi tables, ...).
+453-    # pixi validates its own language; comfy-env does not chase its schema.
+454-    for key, value in cfg.pixi_passthrough.items():
+455-        if key in _HANDLED_PASSTHROUGH or key in _DENIED_PASSTHROUGH:
+347-    deps = _common_base_dependencies(version)
+348-    node_conda = copy.deepcopy(cfg.pixi_passthrough.get("dependencies", {}))
+349-    if node_conda:
+350-        _strip_torch_family(node_conda, name, "[dependencies]", log)
+351-        deps.update(node_conda)
+352-    feat["dependencies"] = deps
+353-
+354-    # PyPI deps: torch family pin (replicated workspace-wide) + node's own
+355-    pypi = _torch_family_pypi(torch_pin, torch_index, log)
+356-    host_pins = _host_derived_pypi(comfyui_dir, host_derived, log)
+357-    # Empty when the operator turned replication off, so the strip below is a
+358-    # no-op then: opting out must leave a pack's own declarations standing.
+359-    _derived_names = _HOST_DERIVED_PKGS if host_derived else ()
+360-    node_pypi = copy.deepcopy(cfg.pixi_passthrough.get("pypi-dependencies", {}))
+361-    if node_pypi:
+362-        _strip_torch_family(node_pypi, name, "[pypi-dependencies]", log)
+363-        # Substitute in place, and ONLY where the pack already declares the
+364-        # package. Adding it to a pack that never asked would put a native CUDA
+365-        # wheel into CPU-only envs and change every env's identity, which is a
+366-        # far larger blast radius than the drift this exists to fix.
+367-        pypi.update(_replace_host_derived(node_pypi, host_pins, name,
+368-                                          log=log, derived=_derived_names))
+369-        pypi.update(node_pypi)
+370-    # Inject even when the pack never asked. These are not the pack's
+371-    # dependencies to declare: the HOST's ComfyUI imports them unguarded, so a
+372-    # worker that lacks one cannot import comfy at all, and a worker cannot be
+373-    # made transparent later without them. Absence is the expensive mistake.
+374-    # Only envs that have torch at all are candidates; within those, the
+375-    # CUDA-only set is skipped on a CPU stack.
+376-    if torch_pin:
+377:        _is_cpu = not torch_index or "cpu" in str(torch_index).lower()
+378-        for pkg, wanted in host_pins.items():
+379:            if _is_cpu and pkg in _HOST_CUDA_ONLY_PKGS:
+380-                continue
+381-            pypi.setdefault(pkg, wanted)
+382-    # CUDA wheels, inlined as direct-URL deps (may carry a #sha256= fragment,
+383-    # which pixi records in the lock and uv verifies). The wheels' in-farm
+384-    # METADATA declares no dependencies, so a URL dep is exactly the
+385-    # `--no-deps` semantics the retired post-pixi uv pass had -- but inside
+386-    # pixi.lock, hashed, cached, and safe against a plain `pixi install`.
+387-    # Merged LAST so neither the torch pin nor an author entry shadows it.
+388-    if cuda_wheel_urls:
+389-        for _pkg, _url in sorted(cuda_wheel_urls.items()):
+390-            _key = _pkg.lower().replace("_", "-")
+391-            pypi[_key] = {"url": _url}
+392-    if pypi:
+393-        feat["pypi-dependencies"] = pypi
+394-
+395-    # Per-target sections (only the current platform's), with torch family stripped
+396-    targets = cfg.pixi_passthrough.get("target", {})
+397-    current = get_pixi_platform()
+398-    if current in targets:
+399-        cur_target = copy.deepcopy(targets[current])
+400-        for tbl in ("dependencies", "pypi-dependencies"):
+401-            if tbl in cur_target:
+402-                _strip_torch_family(
+403-                    cur_target[tbl], name,
+404-                    f"[target.{current}.{tbl}]", log,
+405-                )
+406-                if tbl == "pypi-dependencies":
+407-                    # A target table wins over the feature table on its own
+408-                    # platform, so an unpinned aimdo left here would silently
+409-                    # beat the host pin we just substituted above.
+410-                    pypi.update(_replace_host_derived(
+411-                        cur_target[tbl], host_pins, name,
+412-                        f"[target.{current}.{tbl}]", log,
+413-                        derived=_derived_names,
+414-                    ))
+415-                if not cur_target[tbl]:
+416-                    del cur_target[tbl]
+417-        if cur_target:
+418-            feat.setdefault("target", {})[current] = cur_target
+419-    # The target loop can add host pin substitutes into `pypi` after the
+420-    # attachment above was skipped for being empty. Re-attach so a pack whose
+421-    # ONLY pypi declaration lives in [target.*] does not silently lose it.
+422-    if pypi and "pypi-dependencies" not in feat:
+423-        feat["pypi-dependencies"] = pypi
+424-
+425-    pypi_options = copy.deepcopy(cfg.pixi_passthrough.get("pypi-options", {}))
+426-    if pypi_options:
+427-        feat["pypi-options"] = pypi_options
+428-
+429-    # System requirements: node-declared wins outright; else auto-detect from
+430-    # host (glibc on Linux, torch's wheel macOS floor on macOS). Both may be
+431-    # set on the same platform if applicable.
+432-    # Author-declared [system-requirements] passes through verbatim (their
+433-    # choice of spelling; pixi 0.75 warns on the table but honours it). The
+434-    # AUTO-detected glibc/macos values no longer land here: pixi deprecated
+435-    # the table in favour of keys on the workspace `platforms` entry, so
+436-    # build_env_toml emits them there and this feature stays silent.
+437-    sys_reqs = cfg.pixi_passthrough.get("system-requirements")
+438-    if sys_reqs:
+439-        feat["system-requirements"] = copy.deepcopy(sys_reqs)
+440-
+441-    # [activation]: MERGE (ADR-0013) -- author entries pass through; the
+442-    # compiler's own key wins only on direct collision. Assigning the block
+443-    # outright silently clobbers author activation.
+444-    activation = copy.deepcopy(cfg.pixi_passthrough.get("activation", {}))
+445-    if not isinstance(activation, dict):
+446-        activation = {}
+447-    act_env = activation.setdefault("env", {})
+448-    act_env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+449-    feat["activation"] = activation
+450-
+451-    # Honest passthrough (ADR-0013): every remaining table is forwarded
+452-    # verbatim at the feature level ([tasks], future pixi tables, ...).
+453-    # pixi validates its own language; comfy-env does not chase its schema.
+454-    for key, value in cfg.pixi_passthrough.items():
+455-        if key in _HANDLED_PASSTHROUGH or key in _DENIED_PASSTHROUGH:
+456-            continue
+457-        feat[key] = copy.deepcopy(value)
+458-        log(f"[comfy-env] {name}: passthrough [{key}] -> feature")
+459-    return feat
+460-
+461-
+462-def _torch_family_pins(
+463-    torch_pin: Optional[str],
+464-    log: Callable[[str], None],
+465-) -> Optional[Dict[str, str]]:
+466-    """Return {torch: <pin>, torchvision: <pin>, torchaudio: <pin>} from TORCH_FAMILY_COMPAT.
+467-
+468-    Returns None when `torch_pin` is None. Returns a partial map (`{"torch": pin}` only)
+469-    when torch's minor isn't in the compat table, with a warning logged.
+470-    """
+471-    if not torch_pin:
+472-        return None
+473-    from .cuda_wheels import derive_family_pins
+474-    family = derive_family_pins(torch_pin)
+475-    if family is None:
+476-        log(
+477-            f"[comfy-env] WARNING: torch_pin {torch_pin} not in TORCH_FAMILY_COMPAT; "
+478-            f"pinning torch only, leaving torchvision/torchaudio unpinned"
+479-        )
+===== cuda_wheels.py =====
+"""CUDA wheels index integration. See: https://pozzettiandrea.github.io/cuda-wheels/"""
+
+import json
+import logging
+import re
+import socket
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+from typing import Callable, List, Optional
+
+from ..detection.arch import cpu_arch
+
+try:
+    from importlib.metadata import version as _pkg_version
+    _UA = f"comfy-env/{_pkg_version('comfy-env')}"
+except Exception:
+    _UA = "comfy-env/unknown"
+
+logger = logging.getLogger("comfy-env.cuda-wheels")
+
+CUDA_WHEELS_INDEX_DEFAULT = "https://comfy-forge.github.io/cuda-wheels/"
+
+
+def cuda_wheels_index() -> str:
+    """The cuda-wheels index base URL, with a trailing slash.
+
+    Override with the ``COMFY_ENV_CUDA_WHEELS_INDEX`` environment variable.
+    The point is mirrors: an air-gapped or bandwidth-limited site can serve
+    the same directory listing from its own host without patching comfy-env.
+
+    Resolved per call rather than frozen at import so a test or a caller can
+    change it without reloading the module.
+
+    !! This URL is a TRUST boundary. What it serves is inlined into the
+    generated pixi manifest as a direct-URL pypi-dependency and installed by
+    pixi into the isolated env, where it executes at import time. It is
+    hash-verified only where the index attaches a ``#sha256=`` fragment to
+    the link (``toml_generator._resolve_cuda_wheels`` preserves the fragment;
+    it does not invent one). Point it only at an index you control or trust
+    as much as the default (ADR-0026).
+    """
+    import os
+    raw = (os.environ.get("COMFY_ENV_CUDA_WHEELS_INDEX") or "").strip()
+    if not raw:
+        return CUDA_WHEELS_INDEX_DEFAULT
+    # Every call site does f"{index}{pkg}/", so a missing trailing slash would
+    # silently build ".../v2flash_attn/" instead of failing.
+    return raw if raw.endswith("/") else raw + "/"
+
+
+# Back-compat alias for readers that want the default without calling.
+CUDA_WHEELS_INDEX = CUDA_WHEELS_INDEX_DEFAULT
+
+
+def _ssl_context() -> Optional[ssl.SSLContext]:
+    """Build an SSL context using certifi's CA bundle when available.
+
+    Portable/embedded Python distributions (e.g. ComfyUI's python_embeded) often ship
+    without a complete CA store, which makes urllib fail with CERTIFICATE_VERIFY_FAILED
+    against hosts whose chain isn't in the stripped default store (notably GitHub Pages).
+    certifi is effectively always present (pip depends on it), so prefer it when we can.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return None
+
+# Tier-2 fallback combo. Only consulted by the install pipeline (see
+# install._resolve_wheel_combo) when the host's bootstrap (python, cuda, torch)
+# combo doesn't have every required cuda-wheel published. Keep this aligned with
+# the cuda-wheels build matrix's known-good baseline.
+CUDA_TORCH_MAP = {"12.8": "2.8", "12.4": "2.4"}
+FALLBACK_COMBO = ("12.8", "2.8")  # (cuda, torch) -- always paired with bootstrap python
+
+# ...except on linux aarch64, which is a different world and gets its own cell.
+# Three things rule out simply reusing the x86 combo, or nudging one axis of it:
+#
+#   * (12.8, 2.8) does not exist on ARM. PyTorch shipped no linux-aarch64 wheel
+#     for the whole 2.8 line on cu128 -- torch 2.8.0, torchvision 0.23.0 and
+#     torchaudio 2.8.0 are x86_64/win_amd64 only there. The aarch64 cu128 build
+#     broke during the 2.8 cycle (pytorch#157548) and came back for 2.9.
+#   * (13.0, 2.8) does not exist anywhere: PyTorch's CUDA 13 line starts at
+#     torch 2.9, so 2.8 cannot reach it on any platform.
+#   * Staying on 12.8/12.9 leaves Thor DEAD. Their ARM arch list is
+#     `8.0;9.0+PTX;10.0;12.0+PTX` -- sm_110 has no cubin at or below it (the
+#     10.0 cubin cannot cross a major, the 12.0 PTX is above), so a Thor gets
+#     cudaErrorNoKernelImageForDevice at first kernel launch. 13.0's ARM list
+#     adds 11.0 natively.
+#
+# So ARM takes (13.0, 2.10): every current ARM CUDA product is covered (Grace
+# sm_90, GB200 sm_100, Thor sm_110, Orin sm_87 via the 8.0 cubin), and from
+# torchvision 0.25 / torchaudio 2.10 the ARM wheels are CUDA-tagged (+cu130)
+# rather than the plain CPU-only builds cu128/cu129 carry at that torch level.
+# Cost, stated plainly: CUDA 13 needs driver r580+.
+FALLBACK_COMBO_AARCH64 = ("13.0", "2.10")
+
+# Backend -> wheel-index registry. Data, not an `if backend ==`: callers go
+# through resolve_index_url(backend) rather than hardcoding an index.
+WHEEL_INDEX_REGISTRY: dict[str, dict] = {
+    "cuda": {
+        # Resolved lazily via resolve_index_url() -- see cuda_wheels_index().
+        "index": None,
+        # Keyed by CPU arch: the fallback is a claim about published wheels, and
+        # what upstream publishes differs per architecture.
+        "fallback_combo": {
+            "x86_64": FALLBACK_COMBO,
+            "aarch64": FALLBACK_COMBO_AARCH64,
+        },
+    },
+    # "rocm": {"index": ROCM_WHEELS_INDEX, "fallback_combo": (...)},  # additive later
+}
+
+
+def resolve_index_url(backend: str = "cuda") -> str:
+    """Wheel-index base URL for a backend. Raises for an unregistered backend."""
+    try:
+        WHEEL_INDEX_REGISTRY[backend]          # membership check
+        if backend == "cuda":
+            return cuda_wheels_index()
+        return WHEEL_INDEX_REGISTRY[backend]["index"]
+    except KeyError:
+        raise ValueError(
+            f"no wheel index registered for backend {backend!r}; "
+            f"known: {sorted(WHEEL_INDEX_REGISTRY)}"
+        ) from None
+
+
+def resolve_fallback_combo(backend: str = "cuda", arch: Optional[str] = None) -> tuple:
+    """Tier-2 (toolkit, torch) fallback combo for a backend on this machine's CPU.
+
+    `arch` overrides the detected architecture (for tests); it must be one of
+    the keys registered for the backend.
+    """
+    try:
+        combos = WHEEL_INDEX_REGISTRY[backend]["fallback_combo"]
+    except KeyError:
+        raise ValueError(f"no fallback combo registered for backend {backend!r}") from None
+    arch = arch or cpu_arch()
+    try:
+        return combos[arch]
+    except KeyError:
+        raise ValueError(
+            f"no {backend} fallback combo registered for CPU arch {arch!r}; "
+            f"known: {sorted(combos)}"
+        ) from None
+
+# torch.minor -> (torchvision_minor, torchaudio_minor). Used as a fallback
+# when the bootstrap venv doesn't have torchvision/torchaudio installed
+# (bare-env cases). For Desktop / any bootstrap that already has the family
+# installed, `derive_family_pins` reads the actual installed versions instead
+# — auto-tracks decouplings like torch 2.12 shipping without a matching
+# torchaudio (latest torchaudio for that torch line is 2.11).
+TORCH_FAMILY_COMPAT: dict = {
+    "2.4":  ("0.19", "2.4"),
+    "2.5":  ("0.20", "2.5"),
+    "2.6":  ("0.21", "2.6"),
+    "2.7":  ("0.22", "2.7"),
+    "2.8":  ("0.23", "2.8"),
+    "2.9":  ("0.24", "2.9"),
+    "2.10": ("0.25", "2.10"),
+    "2.11": ("0.26", "2.11"),
+    "2.12": ("0.27", "2.11"),   # torchaudio never shipped 2.12; stuck at 2.11
+}
+
+
+def derive_family_pins(torch_pin: str) -> Optional[tuple]:
+    """Given a torch pin like '==2.11.0' or '==2.8.*', return
+    `(torchvision_pin, torchaudio_pin)` as `==X.Y.*` specs.
+
+    Prefers the bootstrap venv's actually-installed versions when torch_pin
+    matches bootstrap torch — auto-tracks releases like the missing
+    torchaudio 2.12 without needing a table update. Falls back to
+    `TORCH_FAMILY_COMPAT` otherwise (bare envs, cuda-wheel-resolver
+    fallback combos that differ from bootstrap, etc).
+    """
+    m = re.match(r"==\s*(\d+)\.(\d+)", torch_pin)
+    if not m:
+        return None
+    minor_key = f"{m.group(1)}.{m.group(2)}"
+
+    # Bootstrap-derived: authoritative when torch_pin matches bootstrap.
+    try:
+        from ..detection.cuda import (
+            get_bootstrap_torch_version,
+            get_bootstrap_torchvision_version,
+            get_bootstrap_torchaudio_version,
+        )
+        bt_torch = get_bootstrap_torch_version()
+        if bt_torch and bt_torch.startswith(f"{minor_key}."):
+            bt_vision = get_bootstrap_torchvision_version()
+            bt_audio = get_bootstrap_torchaudio_version()
+            if bt_vision and bt_audio:
+                v_mm = ".".join(bt_vision.split(".")[:2])
+                a_mm = ".".join(bt_audio.split(".")[:2])
+                return (f"=={v_mm}.*", f"=={a_mm}.*")
+    except Exception:
+        pass
+
+    pair = TORCH_FAMILY_COMPAT.get(minor_key)
+    if not pair:
+        return None
+    vision_minor, audio_minor = pair
+    return (f"=={vision_minor}.*", f"=={audio_minor}.*")
+
+
+def check_all_wheels_available(packages: List[str], torch_version: str,
+                               cuda_version: str, python_version: str,
+                               log: Optional[Callable[[str], None]] = None) -> Optional[str]:
+    """Check if all required cuda-wheels are available for this CUDA+torch combo.
+
+    Returns None if all packages have wheels, or the name of the first missing package.
+    If `log` is provided, lookup progress and failure reasons are surfaced to the caller's
+    log stream (the cuda_wheels logger is not wired to install logs by default).
+    """
+    for package in packages:
+        url = get_wheel_url(package, torch_version, cuda_version, python_version, log=log)
+        if not url:
+            return package
+    return None
+
+
+def _pkg_variants(package: str) -> List[str]:
+    return [package, package.replace("-", "_"), package.replace("_", "-")]
+
+
+def _platform_tags() -> List[str]:
+    """Substrings a wheel filename must contain to be installable on THIS machine.
+
+    The CPU architecture is load-bearing here, not a detail. Matching on bare
+    "manylinux" accepts `...-manylinux_2_34_x86_64.whl` on an ARM host, so the
+    probe reports the package as published, the combo resolves, and pip only
+    refuses it later ("is not a supported wheel on this platform") -- a quiet
+    failure a long way from its cause. Every wheel platform tag ends in the
+    arch, for both the manylinux and the plain linux spellings, so matching the
+    `_<arch>` suffix covers both and excludes the other architecture.
+    """
+    if sys.platform.startswith("linux"):
+        return [f"_{cpu_arch()}"]
+    if sys.platform == "win32":
+        return ["win_amd64"]
+    return []
+
+
+_TRANSIENT_NET_ERRORS = (ConnectionResetError, socket.timeout, TimeoutError)
+
+
+def _fetch_with_retries(url: str, timeout: int = 10, max_retries: int = 3,
+                        log: Optional[Callable[[str], None]] = None) -> str:
+    """Fetch `url` with a real User-Agent and exponential-backoff retries on
+    transient transport errors. Non-transient HTTP errors (4xx/5xx) are raised
+    immediately. Default Python urllib UA gets RST by some corporate proxies
+    and AV middleboxes, so we always send `comfy-env/<version>`.
+    """
+    backoff = (1, 2, 4)
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": _UA})
+            with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+                return resp.read().decode("utf-8")
+        except urllib.error.HTTPError:
+            raise
+        except urllib.error.URLError as e:
+            if not isinstance(e.reason, _TRANSIENT_NET_ERRORS):
+                raise
+            last_err = e
+        except _TRANSIENT_NET_ERRORS as e:
+            last_err = e
+        if attempt < max_retries - 1:
+            sleep_s = backoff[attempt]
+            if log is not None:
+                log(f"[cuda-wheels]   retry {attempt+1}/{max_retries} after {sleep_s}s ({type(last_err).__name__})")
+            time.sleep(sleep_s)
+    raise last_err
+
+
+def _fetch_from_github_api(package: str, torch_version: str, cuda_version: str,
+                           python_version: str,
+                           log: Optional[Callable[[str], None]] = None) -> Optional[tuple]:
+    """Fallback when the GH Pages index is unreachable: list release assets
+    via `api.github.com/repos/Comfy-Forge/cuda-wheels/releases` and match
+    by the same filename pattern. Different routing edge than Pages, so often
+    works when Fastly is RST-ing the Pages host. Returns `(url, name)` or None.
+    """
+    cuda_short = cuda_version.replace(".", "")[:3]
+    torch_short = ".".join(torch_version.split(".")[:2])
+    py_tag = f"cp{python_version.replace('.', '')}"
+    platform_tags = _platform_tags()
+    local_patterns = [f"+cu{cuda_short}torch{torch_short}", f"+pt{torch_short}cu{cuda_short}"]
+    pkg_variants_set = set(_pkg_variants(package))
+
+    api_url = "https://api.github.com/repos/Comfy-Forge/cuda-wheels/releases?per_page=100"
+    try:
+        body = _fetch_with_retries(api_url, timeout=15, log=log)
+    except Exception as e:
+        if log is not None:
+            log(f"[cuda-wheels]   GitHub Releases API: {type(e).__name__}: {e}")
+        return None
+    try:
+        releases = json.loads(body)
+    except Exception:
+        return None
+
+    candidates = []
+    for release in releases:
+        for asset in release.get("assets", ()):
+            name = asset.get("name", "")
+            wheel_pkg = name.split("-", 1)[0] if "-" in name else ""
+            if wheel_pkg not in pkg_variants_set:
+                continue
+            if not any(p in name for p in local_patterns):
+                continue
+            if py_tag not in name:
+                continue
+            if platform_tags and not any(t in name for t in platform_tags):
+                continue
+===== GPU/Backend Detection =====
+src/comfy_env/detection/__init__.py
+src/comfy_env/detection/backend.py
+src/comfy_env/detection/cuda.py
+src/comfy_env/detection/gpu.py
+src/comfy_env/detection/arch.py
+src/comfy_env/detection/__init__.py:11:from .cuda import (
+src/comfy_env/detection/__init__.py:12:    has_nvidia_gpu,
+src/comfy_env/detection/__init__.py:13:    detect_cuda_version,
+src/comfy_env/detection/__init__.py:16:    get_bootstrap_torch_cuda,
+src/comfy_env/detection/__init__.py:20:    CUDAEnvironment,
+src/comfy_env/detection/__init__.py:24:    detect_cuda_environment,
+src/comfy_env/detection/__init__.py:27:    get_recommended_cuda_version,
+src/comfy_env/detection/__init__.py:65:    # CUDA detection
+src/comfy_env/detection/__init__.py:66:    "has_nvidia_gpu",
+src/comfy_env/detection/__init__.py:67:    "detect_cuda_version",
+src/comfy_env/detection/__init__.py:70:    "get_bootstrap_torch_cuda",
+src/comfy_env/detection/__init__.py:73:    "CUDAEnvironment",
+src/comfy_env/detection/__init__.py:77:    "detect_cuda_environment",
+src/comfy_env/detection/__init__.py:80:    "get_recommended_cuda_version",
+src/comfy_env/detection/backend.py:4:(e.g. '2.5.0+cu128' -> cuda, '2.4.0+rocm6.2' -> rocm, '2.5.0+xpu' -> xpu). That
+src/comfy_env/detection/backend.py:5:label -- not nvidia-smi or the system driver -- is what determines wheel
+src/comfy_env/detection/backend.py:8:Only 'cuda' and 'cpu' are wired end-to-end today. 'rocm'/'xpu'/'mps' are named so
+src/comfy_env/detection/backend.py:11:fixes the prior misdetection: a ROCm torch has torch.cuda.is_available() == True
+src/comfy_env/detection/backend.py:12:but torch.version.cuda is None, so the cuda-only `+cuXXX` parse read it as CPU
+src/comfy_env/detection/backend.py:13:while the torch GPU probe reported a bogus NVIDIA arch.
+src/comfy_env/detection/backend.py:15:detection/cuda.py + detection/gpu.py remain the CUDA-specific probes -- they are
+src/comfy_env/detection/backend.py:16:the 'cuda' branch callers use when detect_backend() returns 'cuda'.
+src/comfy_env/detection/backend.py:23:from .cuda import get_bootstrap_torch_cuda
+src/comfy_env/detection/backend.py:25:# Backends this project knows how to name. Wired end-to-end: cuda, cpu.
+src/comfy_env/detection/backend.py:26:KNOWN_BACKENDS = ("cuda", "rocm", "xpu", "mps", "cpu")
+src/comfy_env/detection/backend.py:30:    """Local part of the installed torch version (e.g. 'cu128', 'rocm6.2', 'xpu'),
+src/comfy_env/detection/backend.py:54:    where meaningful (cuda '12.8', rocm '6.2'), else None.
+src/comfy_env/detection/backend.py:58:        if label.startswith("rocm"):
+src/comfy_env/detection/backend.py:59:            return ("rocm", label[len("rocm"):] or None)
+src/comfy_env/detection/backend.py:61:            # CUDA version parsing lives in detection/cuda.py (the cuda branch).
+src/comfy_env/detection/backend.py:62:            return ("cuda", get_bootstrap_torch_cuda())
+src/comfy_env/detection/cuda.py:8:def has_nvidia_gpu() -> bool:
+src/comfy_env/detection/cuda.py:9:    """Check if NVIDIA GPU is present."""
+src/comfy_env/detection/cuda.py:10:    return detect_cuda_version() is not None
+src/comfy_env/detection/cuda.py:14:def detect_cuda_version() -> str | None:
+src/comfy_env/detection/cuda.py:15:    """Detect system CUDA version. Priority: pixi -> torch metadata.
+src/comfy_env/detection/cuda.py:21:    if pixi_cuda := _get_cuda_from_pixi():
+src/comfy_env/detection/cuda.py:22:        return pixi_cuda
+src/comfy_env/detection/cuda.py:23:    return get_bootstrap_torch_cuda()
+src/comfy_env/detection/cuda.py:26:def _get_cuda_from_pixi() -> str | None:
+src/comfy_env/detection/cuda.py:27:    """Get CUDA version from pixi's virtual package detection."""
+src/comfy_env/detection/cuda.py:36:            if vp.startswith("__cuda="):
+src/comfy_env/detection/cuda.py:114:def get_bootstrap_torch_cuda() -> str | None:
+src/comfy_env/detection/cuda.py:115:    """CUDA version the host torch was built against (e.g. '12.8').
+src/comfy_env/detection/gpu.py:1:"""GPU detection. Methods: NVML -> PyTorch -> nvidia-smi -> sysfs"""
+src/comfy_env/detection/gpu.py:11:from .cuda import detect_cuda_version
+src/comfy_env/detection/gpu.py:22:_cache: tuple[float, "CUDAEnvironment | None"] = (0, None)
+src/comfy_env/detection/gpu.py:43:class CUDAEnvironment:
+src/comfy_env/detection/gpu.py:46:    cuda_runtime_version: str = ""
+src/comfy_env/detection/gpu.py:47:    recommended_cuda: str = ""
+src/comfy_env/detection/gpu.py:63:    env = detect_cuda_environment()
+src/comfy_env/detection/gpu.py:67:def get_recommended_cuda_version(gpus: list[GPUInfo] | None = None) -> str:
+src/comfy_env/detection/gpu.py:70:    linux aarch64 is a different world and always gets 13.0. PyTorch's ARM CUDA
+src/comfy_env/detection/gpu.py:74:    branch below can never be satisfiable there. 12.4 is doubly wrong: NVIDIA's
+src/comfy_env/detection/gpu.py:75:    sbsa apt repo starts at 12.5, so cuda-wheels deliberately does not build it
+src/comfy_env/detection/gpu.py:79:    # Skip GPU detection on explicit CPU test runners (avoids torch import/CUDA warning)
+src/comfy_env/detection/gpu.py:83:    if cuda := detect_cuda_version():
+src/comfy_env/detection/gpu.py:84:        return cuda
+src/comfy_env/detection/gpu.py:86:    gpus = gpus if gpus is not None else detect_cuda_environment().gpus
+src/comfy_env/detection/gpu.py:102:    env = detect_cuda_environment()
+src/comfy_env/detection/gpu.py:107:    return detect_cuda_environment().gpus
+src/comfy_env/detection/gpu.py:110:def detect_cuda_environment(force_refresh: bool = False) -> CUDAEnvironment:
+src/comfy_env/detection/gpu.py:116:    # On Windows, try nvidia-smi first (subprocess, crash-safe) before torch/nvml
+src/comfy_env/detection/gpu.py:129:    env = CUDAEnvironment(
+src/comfy_env/detection/gpu.py:131:        cuda_runtime_version=_get_cuda_version(),
+src/comfy_env/detection/gpu.py:132:        recommended_cuda=get_recommended_cuda_version(gpus or []), detection_method=method,
+src/comfy_env/detection/gpu.py:139:    env = detect_cuda_environment()
+src/comfy_env/detection/gpu.py:145:    if env.cuda_runtime_version: lines.append(f"CUDA: {env.cuda_runtime_version}")
+src/comfy_env/detection/gpu.py:146:    lines.append(f"Recommended: CUDA {env.recommended_cuda}")
+src/comfy_env/detection/gpu.py:174:                cc = pynvml.nvmlDeviceGetCudaComputeCapability(h)
+src/comfy_env/detection/gpu.py:187:        if not torch.cuda.is_available(): return None
+src/comfy_env/detection/gpu.py:189:        for i in range(torch.cuda.device_count()):
+src/comfy_env/detection/gpu.py:190:            p = torch.cuda.get_device_properties(i)
+src/comfy_env/detection/gpu.py:201:            ["nvidia-smi", "--query-gpu=index,name,uuid,pci.bus_id,compute_cap,memory.total,memory.free,driver_version",
+src/comfy_env/detection/gpu.py:229:            gpus.append(GPUInfo(len(gpus), "NVIDIA GPU", (0, 0), "Unknown", pci_bus_id=d.name))
+src/comfy_env/detection/gpu.py:235:    # On Windows, try nvidia-smi first (crash-safe) before pynvml
+src/comfy_env/detection/gpu.py:239:            r = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+src/comfy_env/detection/gpu.py:252:            r = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+src/comfy_env/detection/gpu.py:259:def _get_cuda_version() -> str:
+src/comfy_env/detection/gpu.py:260:    # Use nvidia-smi (subprocess, crash-safe) instead of torch import
+src/comfy_env/detection/gpu.py:263:        r = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=5)
+src/comfy_env/detection/gpu.py:266:                if "CUDA Version" in line:
+src/comfy_env/detection/gpu.py:267:                    return line.split("CUDA Version:")[1].strip().split()[0]
+===== ROCm/CUDA Referenzen im gesamten Projekt =====
+src/comfy_env/install/workspace.py:70:    cpu_index = "https://download.pytorch.org/whl/cpu"
+src/comfy_env/install/workspace.py:129:    torch_index = f"https://download.pytorch.org/whl/{cu_tag}"
+src/comfy_env/install/workspace.py:758:                f"https://download.pytorch.org/whl/cu"
+src/comfy_env/packages/cuda_wheels.py:114:    # "rocm": {"index": ROCM_WHEELS_INDEX, "fallback_combo": (...)},  # additive later
+src/comfy_env/isolation/metadata.py:310:_ACCEL_VOCAB = ("cuda", "rocm", "xpu", "mps")
+src/comfy_env/isolation/metadata.py:397:        # "cuda" / "rocm" / "xpu" / "mps", or None. Meaning: the node
+src/comfy_env/isolation/metadata.py:1836:    """Detected torch backend of THIS machine ("cuda"/"rocm"/"mps"/"cpu"...), cached."""
+src/comfy_env/environment/cache.py:138:        elif backend == "rocm" and ver:
+src/comfy_env/environment/cache.py:139:            parts.append("rocm" + ver.replace(".", ""))
+src/comfy_env/detection/backend.py:4:(e.g. '2.5.0+cu128' -> cuda, '2.4.0+rocm6.2' -> rocm, '2.5.0+xpu' -> xpu). That
+src/comfy_env/detection/backend.py:8:Only 'cuda' and 'cpu' are wired end-to-end today. 'rocm'/'xpu'/'mps' are named so
+src/comfy_env/detection/backend.py:11:fixes the prior misdetection: a ROCm torch has torch.cuda.is_available() == True
+src/comfy_env/detection/backend.py:26:KNOWN_BACKENDS = ("cuda", "rocm", "xpu", "mps", "cpu")
+src/comfy_env/detection/backend.py:30:    """Local part of the installed torch version (e.g. 'cu128', 'rocm6.2', 'xpu'),
+src/comfy_env/detection/backend.py:54:    where meaningful (cuda '12.8', rocm '6.2'), else None.
+src/comfy_env/detection/backend.py:58:        if label.startswith("rocm"):
+src/comfy_env/detection/backend.py:59:            return ("rocm", label[len("rocm"):] or None)
+tests/test_wheels_index_override.py:56:    with pytest.raises(ValueError, match="rocm"):
+tests/test_wheels_index_override.py:57:        cw.resolve_index_url("rocm")
+tests/test_cuda_wheels.py:86:    with pytest.raises(ValueError, match="rocm"):
+tests/test_cuda_wheels.py:87:        cw.resolve_fallback_combo("rocm")
+tests/test_accelerator_decl.py:115:    # A node that runs on Metal but not ROCm says so, and is served on mps.
+tests/test_accelerator_decl.py:118:    assert not md._accelerator_available(["cuda", "rocm"])
+tests/test_memory_manager.py:219:    CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
+tests/test_toml_generator.py:13:        torch_index="https://download.pytorch.org/whl/cpu",
+tests/test_toml_generator.py:58:        pypi = self._pypi(monkeypatch, "https://download.pytorch.org/whl/cu128")
+tests/test_toml_generator.py:62:        pypi = self._pypi(monkeypatch, "https://download.pytorch.org/whl/cu128")
+tests/test_toml_generator.py:70:        pypi = self._pypi(monkeypatch, "https://download.pytorch.org/whl/cpu")
+===== GIT STATUS =====
+===== COMMIT =====
+db427b0 install: refuse an interpreter with no torch
+===== backend.py =====
+===== workspace.py: Torch-Auflösung =====
+15-this replaced was deleted with it.
+16-
+17-Also handles env stamping (ABI + version + torch pin), install-hash skip of
+18-unchanged envs, and the post-install libomp dedupe.
+19-"""
+20-
+21-from __future__ import annotations
+22-
+23-import re
+24-import hashlib
+25-import os
+26-import sys
+27-from pathlib import Path
+28-from typing import Any, Callable, Dict, List, Optional, Tuple
+29-
+30-from ..config import (
+31-    ComfyEnvConfig,
+32-    load_config,
+33-    CONFIG_FILE_NAME,
+34-)
+35-from ..environment.cache import get_env_name
+36-from .helpers import InstallLog, _log_subprocess, _run_pixi, _patch_uv_platform_py
+37-
+38-
+39-_PYTORCH_PACKAGES = {"torch", "torchvision", "torchaudio"}
+40-_INSTALL_HASH_FILE = "install.hash"
+41-
+42-
+43-# Bootstrap probing & node discovery
+44-
+45:def _resolve_workspace_torch(
+46-    log: Callable[[str], None],
+47-) -> Tuple[Optional[str], Optional[str], Optional[str], str, Optional[str]]:
+48-    """Decide (torch_index, cuda_version, cuda_major, python_version, torch_version)
+49-    once for the whole workspace.
+50-
+51-    `cuda_version` is the full string (e.g. "12.4"), used by `get_wheel_url`.
+52-    `cuda_major` is just the leading digit (e.g. "12"), used in `[system-requirements]`.
+53-    `python_version` is the bootstrap interpreter's MAJOR.MINOR (e.g. "3.10").
+54-    `torch_version` is the bootstrap's torch.__version__ (public part), or None
+55-    if torch isn't importable from bootstrap (then the comfyui feature stays
+56-    `torch = "*"` and the cuda-wheel picker reads the actual version from the
+57-    materialized template env post-install).
+58-
+59-    macOS: (None, None, None, py, torch) -- pixi falls through to default PyPI
+60-    which has osx-arm64/osx-64 torch wheels. Linux/Windows + NVIDIA: cu* index
+61-    + version. Linux/Windows without GPU: (cpu_index, None, None, py, torch).
+62-    """
+63-    from ..detection import (
+64-        get_recommended_cuda_version,
+65-        get_gpu_summary,
+66-        get_bootstrap_python_version,
+67-        get_bootstrap_torch_version,
+68-        get_bootstrap_torch_cuda,
+69-    )
+70-    cpu_index = "https://download.pytorch.org/whl/cpu"
+71-    python_version = get_bootstrap_python_version()
+72-    torch_version = get_bootstrap_torch_version()
+73-    bootstrap_cuda = get_bootstrap_torch_cuda()
+74-
+75-    # Portable ComfyUI ships torch+cu128 inside python_embeded, so bootstrap_cuda
+76-    # is "12.8" even on a hosted runner with no NVIDIA driver. Treat it as
+77-    # CPU-only when no GPU is actually present -- otherwise pixi installs cu*
+78-    # wheels into every env and `import torch` later dies with WinError 127
+79-    # (or its Linux equivalent) trying to load shm.dll / libtorch_cuda.so.
+80-    from ..detection.cuda import has_nvidia_gpu
+81-    if bootstrap_cuda and not has_nvidia_gpu():
+82-        log(
+83-            f"[comfy-env] Bootstrap torch is cu{bootstrap_cuda.replace('.', '')[:3]} "
+84-            f"but no NVIDIA GPU detected -- ignoring cuda tag, using CPU index"
+85-        )
+86-        bootstrap_cuda = None
+87-
+88-    cu_tag_bootstrap = (
+89-        f"cu{bootstrap_cuda.replace('.', '')}" if bootstrap_cuda else "cpu"
+90-    )
+91-    py_short = python_version.replace(".", "") if python_version else "?"
+92-    if torch_version:
+93-        log(
+94-            f"[comfy-env] Bootstrap interpreter has python {python_version} + "
+95-            f"torch {torch_version} ({cu_tag_bootstrap}). Looking for cuda-only "
+96-            f"wheels matching {cu_tag_bootstrap}/torch{torch_version.rsplit('.', 1)[0]}/cp{py_short}."
+97-        )
+98-    else:
+99-        # A Python with no torch is not a ComfyUI's: ComfyUI imports torch
+100-        # unconditionally, and a CPU-only ComfyUI still has a CPU torch. So
+101-        # this can only mean install.py was run with some other interpreter.
+102-        # An env built from it is keyed `py3XX-notorch` and stamped for a host
+103-        # that has no torch, which no real host ever is, so nothing can bind
+104-        # it -- a gigabyte of the wrong torch in a directory nothing will use.
+105-        # Refuse here, before any disk is touched, and say what to run.
+106-        raise RuntimeError(
+107-            f"[comfy-env] The interpreter running this install (python "
+108-            f"{python_version}, {sys.executable}) has no torch, so it is not a "
+109-            f"ComfyUI's. Envs are keyed on the ComfyUI interpreter's python, "
+110-            f"torch and CUDA, and one built without them can never be bound. "
+111-            f"Run install.py with the python that runs ComfyUI's main.py."
+112-        )
+113-
+114-    if sys.platform == "darwin":
+115-        # PyTorch's `/whl/cpu/` index is Linux+Windows-only — there are no
+116-        # osx-arm64 / osx-64 wheels there. macOS torch lives on regular PyPI
+117-        # (the wheel is implicitly CPU-only since there's no CUDA on Apple
+118-        # Silicon). Returning None for torch_index lets pixi resolve from the
+119-        # default PyPI index instead of erroring "no matching platform tag".
+120-        return None, None, None, python_version, torch_version
+121-
+122-    log(f"[comfy-env] GPU: {get_gpu_summary()}")
+123-    cuda_version = bootstrap_cuda or get_recommended_cuda_version()
+124-    if not cuda_version:
+125-        log("[comfy-env] No CUDA detected -- pinning comfyui torch to CPU index")
+126-        return cpu_index, None, None, python_version, torch_version
+127-
+128-    cu_tag = "cu" + cuda_version.replace(".", "")[:3]
+129-    torch_index = f"https://download.pytorch.org/whl/{cu_tag}"
+130-    cuda_major = cuda_version.split(".")[0]
+131-    src = "bootstrap torch" if bootstrap_cuda else "GPU driver"
+132-    log(
+133-        f"[comfy-env] Comfyui feature -> torch {torch_version or '*'} from "
+134-        f"{torch_index} (CUDA {cuda_version} via {src})"
+135-    )
+136-    return torch_index, cuda_version, cuda_major, python_version, torch_version
+137-
+138-
+139-def _bindable_config_paths(plugin_dir: Path) -> List[Path]:
+140-    """The ONLY locations the runtime binder supports: `nodes/comfy-env.toml`
+141-    and `nodes/<subdir>/comfy-env.toml` (isolation/wrap.py pattern 1 and 2).
+142-
+143-    Discovery enumerates exactly these shapes -- deliberately NOT a recursive
+144-    glob. A config anywhere else (pack root, deeper nesting, vendored trees)
+145-    could be materialized but never bound, silently wasting gigabytes; by
+146-    matching discovery to binding, that whole class cannot occur.
+147-    """
+148-    nodes_dir = plugin_dir / "nodes"
+149-    if not nodes_dir.is_dir():
+150-        return []
+151-    out = []
+152-    root_cf = nodes_dir / CONFIG_FILE_NAME
+153-    if root_cf.is_file():
+154-        out.append(root_cf)
+155-    for child in sorted(nodes_dir.iterdir()):
+156-        if child.is_dir() and not child.name.startswith((".", "_")):
+157-            cf = child / CONFIG_FILE_NAME
+158-            if cf.is_file():
+159-                out.append(cf)
+160-    return out
+161-
+162-
+163-def _discover_node_configs(
+164-    comfyui_dir: Path,
+165-    log: Callable[[str], None] = print,
+166-    failures: Optional[List[Tuple[Path, Exception]]] = None,
+167-) -> List[Tuple[str, Path, Path, ComfyEnvConfig]]:
+168-    """Find bindable comfy-env.toml configs under custom_nodes/ and pair
+169-    with (env_name, plugin_dir, config_path, cfg).
+170-
+171-    Only the shapes the runtime can bind are discovered (see
+172-    `_bindable_config_paths`). Duplicate env names across configs are a
+173-    hard error: proceeding would make both configs share one env dir and
+174-    overwrite each other's install hash -- a permanent multi-GB rebuild
+175-    loop with no diagnostic (the 2026-08 review's collision-thrash defect).
+176-
+177-    Logs the scan loudly so failed parses don't silently produce an empty result.
+178-
+179-    A config that does not parse is SKIPPED, not fatal: this sweep covers
+180-    every pack on the machine, and one pack's typo must not abort another
+181-    pack's install (the per-env isolation rule -- see ADR-0007). The
+182-    calling pack's OWN config is loaded unwrapped by `install()`, so an
+183-    author's own mistake still hard-errors where they can see it. Skipped
+184-    configs are appended to `failures` (when provided) so the caller can
+185-    report them instead of finishing with a silent success.
+186-    """
+187-    custom_nodes = comfyui_dir / "custom_nodes"
+188-    if not custom_nodes.is_dir():
+189-        log(f"[comfy-env] _discover: {custom_nodes} is not a directory")
+190-        return []
+191-
+192-    log("")
+193-    log(f"[comfy-env] _discover: scanning {custom_nodes}")
+194-    out: List[Tuple[str, Path, Path, ComfyEnvConfig]] = []
+195-    seen: Dict[str, Path] = {}
+196-    for plugin_dir in sorted(custom_nodes.iterdir()):
+197-        if not plugin_dir.is_dir():
+198-            continue
+199-        if plugin_dir.name.startswith((".", "_")):
+200-            log(f"[comfy-env] _discover: skip {plugin_dir.name} (dot/underscore prefix)")
+201-            continue
+202-        # Quarantine suffix used by _node_guard and other "disable this node
+203-        # without deleting it" tools. Skip so we don't materialize a pixi env
+204-        # for a node that isn't even being loaded by ComfyUI.
+205-        if plugin_dir.name.endswith((".disabled", "._disabled")):
+206-            log(f"[comfy-env] _discover: skip {plugin_dir.name} (quarantine suffix)")
+207-            continue
+208-        toml_files = _bindable_config_paths(plugin_dir)
+209-        if not toml_files:
+210-            log(f"[comfy-env] _discover: {plugin_dir.name}: no bindable {CONFIG_FILE_NAME}")
+211-            continue
+212-        for cf in toml_files:
+213-            try:
+214-                cfg = load_config(cf)
+215-            except (ValueError, OSError) as e:
+216-                # Data errors only (ValueError covers TOMLDecodeError and
+217-                # every schema rejection). Anything else -- AttributeError,
+218-                # KeyError, TypeError -- is a bug in the config layer, not a
+219-                # bad file, and must propagate instead of being relabelled
+220-                # as the user's fault.
+221-                log(
+222-                    f"[comfy-env] WARNING: skipping {cf} -- "
+223-                    f"{type(e).__name__}: {e}"
+224-                )
+225-                log(
+===== workspace.py: Wheel-Auflösung =====
+===== toml_generator.py: Torch/CPU/Index =====
+16-from pathlib import Path
+17-from typing import Any, Callable, Dict, Iterable, List, Optional
+18-
+19-from ..config import ComfyEnvConfig
+20-from ..detection import get_pixi_platform
+21-
+22-
+23-_TORCH_PKGS = {"torch", "torchvision", "torchaudio"}
+24-
+25-
+26-def _require_tomli_w():
+27-    try:
+28-        import tomli_w
+29-        return tomli_w
+30-    except ImportError:
+31-        raise ImportError("tomli-w required: pip install tomli-w")
+32-
+33-
+34-# requirements.txt parsing
+35-
+36-
+37-def _common_base_dependencies(version: str) -> Dict[str, Any]:
+38-    """Conda deps every env needs: python pin + pip + setuptools."""
+39-    return {
+40-        "python": f"{version}.*",
+41-        "pip": "*",
+42-        "setuptools": ">=75.0,<82",
+43-    }
+44-
+45-
+46:def _torch_family_pypi(
+47-    torch_pin: Optional[str],
+48-    torch_index: Optional[str],
+49-    log: Callable[[str], None],
+50-) -> Dict[str, Any]:
+51-    """Build `{torch, torchvision, torchaudio}` pypi-deps, optionally with `index` attached.
+52-
+53-    Replicated verbatim into every feature so each env resolves identical torch
+54-    files and pixi's content-addressable cache hardlink-shares them. When
+55-    `torch_index` is set (Linux/Windows + CUDA path), the index is attached to
+56-    every entry. When it's None (macOS, where the PyTorch /whl/cpu index has no
+57-    osx-arm64 wheels), the pin is emitted without an index so pixi resolves
+58-    from the default PyPI. `_torch_family_pins` already returns a partial map
+59-    `{"torch": pin}` when the family table doesn't know `torch.minor` yet --
+60-    that's the right behavior for torch 2.12-style "ahead of family" cases
+61-    where torchaudio hasn't shipped yet.
+62-    """
+63-    if not torch_pin:
+64-        return {}
+65-    pin_map = _torch_family_pins(torch_pin, log)
+66-    if not pin_map:
+67-        return {}
+68-    if torch_index:
+69-        return {pkg: {"version": pin, "index": torch_index}
+70-                for pkg, pin in pin_map.items()}
+71-    return dict(pin_map)
+72-
+73-
+74-#: Packages whose version is derived from the host ComfyUI rather than authored
+75-#: here. Same rule as the torch family: comfy-env replicates a pin it reads, it
+76-#: never invents one. comfy-aimdo ships weekly and ComfyUI pins it exactly, so a
+77-#: literal in this repository would be stale within the month.
+78-_HOST_DERIVED_PKGS = ("comfy-aimdo", "comfy-kitchen")
+79-
+80-#: Of those, the ones that only make sense on a CUDA stack. comfy-aimdo has
+81-#: no CPU path (``_vbar_get`` returns None for a CPU load device and
+82-#: MAX_PINNED_MEMORY stays -1), so injecting it into a CPU env is dead
+83-#: weight. comfy-kitchen is NOT in this set: the host's ComfyUI imports it
+84-#: unguarded from four modules on the ``comfy.model_patcher`` import chain
+85-#: (comfy/ldm/modules/attention.py:13, ldm/joyimage/model.py:5,
+86-#: ldm/lightricks/vae/na_diffusion_decoder.py:30, text_encoders/llama.py:8),
+87-#: so ANY worker that imports comfy needs it, CPU included. Four of nineteen
+88-#: worker envs on the development machine could not import
+89-#: comfy.model_patcher at all for exactly this reason.
+90-_HOST_CUDA_ONLY_PKGS = frozenset({"comfy-aimdo"})
+91-
+92-
+93-def read_host_pin(comfyui_dir: Optional[Path], package: str) -> Optional[str]:
+94-    """Read an exact ``==`` pin for `package` out of the host ComfyUI's requirements.
+95-
+96-    Returns None when the file, or the pin, is absent. Never raises: a worker
+97-    env that cannot resolve the host's pin is built without the package, which
+98-    is exactly today's behaviour.
+99-    """
+100-    # Prefer the INSTALLED distribution in the environment running this
+101-    # install, which is the host env: the worker's skew guard compares against
+102-    # the parent's installed wheel (importlib.metadata), so pinning from the
+103-    # requirements file while the venv lags it would make every worker refuse
+104-    # aimdo, silently and permanently. One source of truth, the running host.
+105-    try:
+106-        from importlib.metadata import PackageNotFoundError, version
+107-
+108-        return version(package)
+109-    except PackageNotFoundError:
+110-        pass
+111-    except Exception:
+112-        pass
+113-    if comfyui_dir is None:
+114-        return None
+115-    req = Path(comfyui_dir) / "requirements.txt"
+116-    try:
+117-        text = req.read_text(encoding="utf-8", errors="replace")
+118-    except OSError:
+119-        return None
+120-    # Build the alternation explicitly: relying on whether re.escape() escapes
+121-    # "-" is version dependent behaviour to hang a parser on.
+122-    stem = "[-_]".join(re.escape(part) for part in package.split("-"))
+123-    pattern = re.compile(
+124-        r"^\s*" + stem + r"\s*==\s*([^\s#;]+)", re.IGNORECASE | re.MULTILINE
+125-    )
+126-    match = pattern.search(text)
+127-    return match.group(1) if match else None
+128-
+129-
+130-def _canonical(name: str) -> str:
+131-    """PEP 503 name normalisation: lowercase, any run of -_. becomes a hyphen."""
+132-    return re.sub(r"[-_.]+", "-", name).lower()
+133-
+134-
+135-def _declared_spec(value: Any) -> Optional[str]:
+136-    """The version spec a pixi pypi entry carries, string or table form."""
+137-    if isinstance(value, str):
+138-        return value
+139-    if isinstance(value, dict):
+140-        got = value.get("version")
+141-        return got if isinstance(got, str) else None
+142-    return None
+143-
+144-
+145-def _replace_host_derived(
+146-    node_pypi: Dict[str, Any],
+--
+188-            if canon in canon_derived:
+189-                node_pypi.pop(key)
+190-                log(
+191-                    f"[pixi] {label} {name}: dropping `{key}` (no host pin to "
+192-                    f"replicate, and this is not a pack's version to choose); "
+193-                    f"the solver picks"
+194-                )
+195-            continue
+196-        pkg, wanted = match
+197-        declared = node_pypi.pop(key)
+198-        spec = _declared_spec(declared)
+199-        if spec and spec.startswith("==") and spec != wanted:
+200-            raise ValueError(
+201-                f"[{name}] comfy-env.toml pins {key}{spec} in {label}, but the "
+202-                f"host ComfyUI pins {wanted}. A worker and its host must agree "
+203-                f"on this package. Remove the pin and comfy-env will replicate "
+204-                f"the host's."
+205-            )
+206-        out[pkg] = wanted
+207-        log(f"[{name}] {label} {key}={spec or declared!r} replaced by the host's {wanted}")
+208-    return out
+209-
+210-
+211-def _host_derived_pypi(
+212-    comfyui_dir: Optional[Path],
+213-    enabled: bool,
+214-    log: Callable[[str], None],
+215-) -> Dict[str, Any]:
+216-    """Pins replicated from the host ComfyUI, when the caller opted in.
+217-
+218:    On by default, for the same reason `_torch_family_pypi` is: an ABI sensitive
+219-    native wheel straddling a process boundary is not a per user preference.
+220-    Packs ship the identical boilerplate `comfy-aimdo = "*"`, pixi resolves that
+221-    wildcard on whatever day the env was built, and the result drifts off the
+222-    host. That has already happened: a worker env here holds 0.4.14 against a
+223-    host pinned to 0.4.13.
+224-
+225-    Replicating rather than authoring is the whole rule. When the host declares
+226-    no pin, this returns nothing and the pack's own spec stands, which is the
+227-    behaviour before this existed.
+228-    """
+229-    if not enabled:
+230-        return {}
+231-    out: Dict[str, Any] = {}
+232-    for pkg in _HOST_DERIVED_PKGS:
+233-        pin = read_host_pin(comfyui_dir, pkg)
+234-        if pin:
+235-            out[pkg] = f"=={pin}"
+236-            log(f"[pixi] replicating host pin {pkg}=={pin}")
+237-        else:
+238-            log(
+239-                f"[pixi] no `{pkg}==` pin in the host ComfyUI's requirements.txt; "
+240-                f"leaving whatever the pack declares. Parent and worker may "
+241-                f"resolve different versions."
+242-            )
+243-    return out
+244-
+245-
+246-def _validate_node_config(name: str, cfg: ComfyEnvConfig) -> None:
+247-    """Reject node configs that try to redefine the workspace torch pin."""
+248-    bad = [p for p in cfg.cuda_packages if p in _TORCH_PKGS]
+249-    if bad:
+250-        raise ValueError(
+251-            f"[{name}] comfy-env.toml has {bad} under [cuda] packages. "
+252-            "Plain torch/torchvision/torchaudio are pinned workspace-wide "
+253-            "(replicated into every feature so the rattler cache dedupes). "
+254-            "Remove them from [cuda] packages -- keep only CUDA-only wheels there "
+255-            "(cumesh, flash-attn, cc_torch, nvdiffrast, etc.)."
+256-        )
+257-
+258-
+259-def _strip_torch_family(
+260-    table: Dict[str, Any],
+261-    name: str,
+262-    where: str,
+263-    log: Callable[[str], None],
+264-) -> None:
+265-    """Remove plain torch/torchvision/torchaudio entries from a deps table in place.
+266-
+267-    Torch family is pinned workspace-wide and added directly to each feature by
+268-    `_build_node_feature`. Node-level declarations are stripped so they can't
+269-    shadow the pin.
+270-    """
+271-    for k in list(table.keys()):
+272-        if k.lower() in _TORCH_PKGS:
+273-            del table[k]
+274-            log(f"[comfy-env] {name}: ignoring `{k}` in {where} (pinned workspace-wide)")
+275-
+276-
+277-# ---------------------------------------------------------------------------
+278-# ADR-0013 passthrough contract: forward everything pixi owns; the sets below
+279-# are the ENTIRE schema knowledge comfy-env keeps about pixi's language.
+280-#
+281-# _HANDLED_PASSTHROUGH: tables the compiler already places/transforms itself
+282-#   (torch-family REWRITE inside dependencies/pypi-dependencies; [activation]
+283-#   MERGE; workspace.channels forwarding). Wire types declare in
+284-#   comfy-env-root.toml [types] (ADR-0015), not here.
+285-# _DENIED_PASSTHROUGH / _DENIED_WORKSPACE_KEYS: compiler-owned, hard error --
+286-#   the single-feature/single-env manifest shape IS ADR-0007, and platforms/
+287-#   name/version are host-derived identity.
+288-# Everything else is forwarded verbatim at the feature level; pixi (pinned,
+289-# ADR-0002) validates its own language.
+290-# ---------------------------------------------------------------------------
+291-_HANDLED_PASSTHROUGH = {
+292-    "dependencies", "pypi-dependencies", "target", "pypi-options",
+293-    "system-requirements", "activation", "workspace",
+294-}
+295-_DENIED_PASSTHROUGH = {"environments", "feature"}
+296-_DENIED_WORKSPACE_KEYS = {"name", "version", "platforms"}
+297-
+298-
+299-def _validate_passthrough(env_name: str, cfg: ComfyEnvConfig) -> None:
+300-    """Hard-error on compiler-owned keys (ADR-0013 deny list)."""
+301-    denied = sorted(_DENIED_PASSTHROUGH & set(cfg.pixi_passthrough))
+302-    if denied:
+303-        raise ValueError(
+304-            f"{env_name}: comfy-env.toml declares compiler-owned table(s) "
+305-            f"{', '.join('[' + d + ']' for d in denied)} -- the per-env "
+306-            f"manifest is single-feature/single-environment by design "
+307-            f"(ADR-0007); comfy-env generates these."
+308-        )
+309-    ws = cfg.pixi_passthrough.get("workspace", {})
+310-    ws_denied = sorted(_DENIED_WORKSPACE_KEYS & set(ws))
+311-    if ws_denied:
+312-        raise ValueError(
+313-            f"{env_name}: comfy-env.toml declares compiler-owned workspace "
+314-            f"key(s) {', '.join(ws_denied)} -- name/version are env identity "
+315-            f"and platforms is derived from the host machine."
+316-        )
+317-
+318-
+319-def _build_node_feature(
+320-    cfg: ComfyEnvConfig,
+321-    name: str,
+322-    version: str,
+323-    torch_pin: Optional[str],
+324-    torch_index: Optional[str],
+325-    glibc_version: Optional[str],
+326-    log: Callable[[str], None] = print,
+327-    macos_version: Optional[str] = None,
+328-    cuda_wheel_urls: Optional[Dict[str, str]] = None,
+329-    comfyui_dir: Optional[Path] = None,
+330-    host_derived: bool = True,
+331-) -> Dict[str, Any]:
+332-    """Emit a self-contained pixi `[feature.<name>.*]` block for one env.
+333-
+334-    Each node env owns its full feature: python pin, pip/setuptools, glibc,
+335-    KMP env var, torch family pin (replicated from workspace -- see
+336:    `_torch_family_pypi`), and the node's own deps from `comfy-env.toml`.
+337-    No base feature is composed in. Plain torch/torchvision/torchaudio entries
+338-    in the node's own deps are stripped so they can't shadow the workspace pin.
+339-
+340-    `pypi-options` from the node's `comfy-env.toml` is passed through verbatim,
+341-    so a node author can still express `[pypi-options.dependency-overrides]`
+342-    manually to redirect a specific transitive resolution.
+343-    """
+344-    feat: Dict[str, Any] = {}
+345-
+346-    # Conda deps: base (python/pip/setuptools) + node's own
+347-    deps = _common_base_dependencies(version)
+348-    node_conda = copy.deepcopy(cfg.pixi_passthrough.get("dependencies", {}))
+349-    if node_conda:
+350-        _strip_torch_family(node_conda, name, "[dependencies]", log)
+351-        deps.update(node_conda)
+352-    feat["dependencies"] = deps
+353-
+354-    # PyPI deps: torch family pin (replicated workspace-wide) + node's own
+355:    pypi = _torch_family_pypi(torch_pin, torch_index, log)
+356-    host_pins = _host_derived_pypi(comfyui_dir, host_derived, log)
+357-    # Empty when the operator turned replication off, so the strip below is a
+358-    # no-op then: opting out must leave a pack's own declarations standing.
+359-    _derived_names = _HOST_DERIVED_PKGS if host_derived else ()
+360-    node_pypi = copy.deepcopy(cfg.pixi_passthrough.get("pypi-dependencies", {}))
+361-    if node_pypi:
+362-        _strip_torch_family(node_pypi, name, "[pypi-dependencies]", log)
+363-        # Substitute in place, and ONLY where the pack already declares the
+364-        # package. Adding it to a pack that never asked would put a native CUDA
+365-        # wheel into CPU-only envs and change every env's identity, which is a
+366-        # far larger blast radius than the drift this exists to fix.
+367-        pypi.update(_replace_host_derived(node_pypi, host_pins, name,
+368-                                          log=log, derived=_derived_names))
+369-        pypi.update(node_pypi)
+370-    # Inject even when the pack never asked. These are not the pack's
+371-    # dependencies to declare: the HOST's ComfyUI imports them unguarded, so a
+372-    # worker that lacks one cannot import comfy at all, and a worker cannot be
+373-    # made transparent later without them. Absence is the expensive mistake.
+374-    # Only envs that have torch at all are candidates; within those, the
+375-    # CUDA-only set is skipped on a CPU stack.
+376-    if torch_pin:
+377-        _is_cpu = not torch_index or "cpu" in str(torch_index).lower()
+378-        for pkg, wanted in host_pins.items():
+379-            if _is_cpu and pkg in _HOST_CUDA_ONLY_PKGS:
+380-                continue
+381-            pypi.setdefault(pkg, wanted)
+382-    # CUDA wheels, inlined as direct-URL deps (may carry a #sha256= fragment,
+383-    # which pixi records in the lock and uv verifies). The wheels' in-farm
+384-    # METADATA declares no dependencies, so a URL dep is exactly the
+385-    # `--no-deps` semantics the retired post-pixi uv pass had -- but inside
+386-    # pixi.lock, hashed, cached, and safe against a plain `pixi install`.
+387-    # Merged LAST so neither the torch pin nor an author entry shadows it.
+388-    if cuda_wheel_urls:
+389-        for _pkg, _url in sorted(cuda_wheel_urls.items()):
+390-            _key = _pkg.lower().replace("_", "-")
+391-            pypi[_key] = {"url": _url}
+392-    if pypi:
+393-        feat["pypi-dependencies"] = pypi
+394-
+395-    # Per-target sections (only the current platform's), with torch family stripped
+396-    targets = cfg.pixi_passthrough.get("target", {})
+397-    current = get_pixi_platform()
+398-    if current in targets:
+399-        cur_target = copy.deepcopy(targets[current])
+400-        for tbl in ("dependencies", "pypi-dependencies"):
+401-            if tbl in cur_target:
+402-                _strip_torch_family(
+403-                    cur_target[tbl], name,
+404-                    f"[target.{current}.{tbl}]", log,
+405-                )
+406-                if tbl == "pypi-dependencies":
+407-                    # A target table wins over the feature table on its own
+408-                    # platform, so an unpinned aimdo left here would silently
+409-                    # beat the host pin we just substituted above.
+410-                    pypi.update(_replace_host_derived(
+411-                        cur_target[tbl], host_pins, name,
+412-                        f"[target.{current}.{tbl}]", log,
+413-                        derived=_derived_names,
+414-                    ))
+415-                if not cur_target[tbl]:
+416-                    del cur_target[tbl]
+417-        if cur_target:
+418-            feat.setdefault("target", {})[current] = cur_target
+419-    # The target loop can add host pin substitutes into `pypi` after the
+420-    # attachment above was skipped for being empty. Re-attach so a pack whose
+421-    # ONLY pypi declaration lives in [target.*] does not silently lose it.
+422-    if pypi and "pypi-dependencies" not in feat:
+423-        feat["pypi-dependencies"] = pypi
+424-
+425-    pypi_options = copy.deepcopy(cfg.pixi_passthrough.get("pypi-options", {}))
+426-    if pypi_options:
+427-        feat["pypi-options"] = pypi_options
+428-
+429-    # System requirements: node-declared wins outright; else auto-detect from
+430-    # host (glibc on Linux, torch's wheel macOS floor on macOS). Both may be
+431-    # set on the same platform if applicable.
+432-    # Author-declared [system-requirements] passes through verbatim (their
+433-    # choice of spelling; pixi 0.75 warns on the table but honours it). The
+434-    # AUTO-detected glibc/macos values no longer land here: pixi deprecated
+435-    # the table in favour of keys on the workspace `platforms` entry, so
+436-    # build_env_toml emits them there and this feature stays silent.
+437-    sys_reqs = cfg.pixi_passthrough.get("system-requirements")
+438-    if sys_reqs:
+439-        feat["system-requirements"] = copy.deepcopy(sys_reqs)
+440-
+441-    # [activation]: MERGE (ADR-0013) -- author entries pass through; the
+442-    # compiler's own key wins only on direct collision. Assigning the block
+443-    # outright silently clobbers author activation.
+444-    activation = copy.deepcopy(cfg.pixi_passthrough.get("activation", {}))
+445-    if not isinstance(activation, dict):
+446-        activation = {}
+447-    act_env = activation.setdefault("env", {})
+448-    act_env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+449-    feat["activation"] = activation
+450-
+451-    # Honest passthrough (ADR-0013): every remaining table is forwarded
+452-    # verbatim at the feature level ([tasks], future pixi tables, ...).
+453-    # pixi validates its own language; comfy-env does not chase its schema.
+454-    for key, value in cfg.pixi_passthrough.items():
+455-        if key in _HANDLED_PASSTHROUGH or key in _DENIED_PASSTHROUGH:
+347-    deps = _common_base_dependencies(version)
+348-    node_conda = copy.deepcopy(cfg.pixi_passthrough.get("dependencies", {}))
+349-    if node_conda:
+350-        _strip_torch_family(node_conda, name, "[dependencies]", log)
+351-        deps.update(node_conda)
+352-    feat["dependencies"] = deps
+353-
+354-    # PyPI deps: torch family pin (replicated workspace-wide) + node's own
+355-    pypi = _torch_family_pypi(torch_pin, torch_index, log)
+356-    host_pins = _host_derived_pypi(comfyui_dir, host_derived, log)
+357-    # Empty when the operator turned replication off, so the strip below is a
+358-    # no-op then: opting out must leave a pack's own declarations standing.
+359-    _derived_names = _HOST_DERIVED_PKGS if host_derived else ()
+360-    node_pypi = copy.deepcopy(cfg.pixi_passthrough.get("pypi-dependencies", {}))
+361-    if node_pypi:
+362-        _strip_torch_family(node_pypi, name, "[pypi-dependencies]", log)
+363-        # Substitute in place, and ONLY where the pack already declares the
+364-        # package. Adding it to a pack that never asked would put a native CUDA
+365-        # wheel into CPU-only envs and change every env's identity, which is a
+366-        # far larger blast radius than the drift this exists to fix.
+367-        pypi.update(_replace_host_derived(node_pypi, host_pins, name,
+368-                                          log=log, derived=_derived_names))
+369-        pypi.update(node_pypi)
+370-    # Inject even when the pack never asked. These are not the pack's
+371-    # dependencies to declare: the HOST's ComfyUI imports them unguarded, so a
+372-    # worker that lacks one cannot import comfy at all, and a worker cannot be
+373-    # made transparent later without them. Absence is the expensive mistake.
+374-    # Only envs that have torch at all are candidates; within those, the
+375-    # CUDA-only set is skipped on a CPU stack.
+376-    if torch_pin:
+377:        _is_cpu = not torch_index or "cpu" in str(torch_index).lower()
+378-        for pkg, wanted in host_pins.items():
+379:            if _is_cpu and pkg in _HOST_CUDA_ONLY_PKGS:
+380-                continue
+381-            pypi.setdefault(pkg, wanted)
+382-    # CUDA wheels, inlined as direct-URL deps (may carry a #sha256= fragment,
+383-    # which pixi records in the lock and uv verifies). The wheels' in-farm
+384-    # METADATA declares no dependencies, so a URL dep is exactly the
+385-    # `--no-deps` semantics the retired post-pixi uv pass had -- but inside
+386-    # pixi.lock, hashed, cached, and safe against a plain `pixi install`.
+387-    # Merged LAST so neither the torch pin nor an author entry shadows it.
+388-    if cuda_wheel_urls:
+389-        for _pkg, _url in sorted(cuda_wheel_urls.items()):
+390-            _key = _pkg.lower().replace("_", "-")
+391-            pypi[_key] = {"url": _url}
+392-    if pypi:
+393-        feat["pypi-dependencies"] = pypi
+394-
+395-    # Per-target sections (only the current platform's), with torch family stripped
+396-    targets = cfg.pixi_passthrough.get("target", {})
+397-    current = get_pixi_platform()
+398-    if current in targets:
+399-        cur_target = copy.deepcopy(targets[current])
+400-        for tbl in ("dependencies", "pypi-dependencies"):
+401-            if tbl in cur_target:
+402-                _strip_torch_family(
+403-                    cur_target[tbl], name,
+404-                    f"[target.{current}.{tbl}]", log,
+405-                )
+406-                if tbl == "pypi-dependencies":
+407-                    # A target table wins over the feature table on its own
+408-                    # platform, so an unpinned aimdo left here would silently
+409-                    # beat the host pin we just substituted above.
+410-                    pypi.update(_replace_host_derived(
+411-                        cur_target[tbl], host_pins, name,
+412-                        f"[target.{current}.{tbl}]", log,
+413-                        derived=_derived_names,
+414-                    ))
+415-                if not cur_target[tbl]:
+416-                    del cur_target[tbl]
+417-        if cur_target:
+418-            feat.setdefault("target", {})[current] = cur_target
+419-    # The target loop can add host pin substitutes into `pypi` after the
+420-    # attachment above was skipped for being empty. Re-attach so a pack whose
+421-    # ONLY pypi declaration lives in [target.*] does not silently lose it.
+422-    if pypi and "pypi-dependencies" not in feat:
+423-        feat["pypi-dependencies"] = pypi
+424-
+425-    pypi_options = copy.deepcopy(cfg.pixi_passthrough.get("pypi-options", {}))
+426-    if pypi_options:
+427-        feat["pypi-options"] = pypi_options
+428-
+429-    # System requirements: node-declared wins outright; else auto-detect from
+430-    # host (glibc on Linux, torch's wheel macOS floor on macOS). Both may be
+431-    # set on the same platform if applicable.
+432-    # Author-declared [system-requirements] passes through verbatim (their
+433-    # choice of spelling; pixi 0.75 warns on the table but honours it). The
+434-    # AUTO-detected glibc/macos values no longer land here: pixi deprecated
+435-    # the table in favour of keys on the workspace `platforms` entry, so
+436-    # build_env_toml emits them there and this feature stays silent.
+437-    sys_reqs = cfg.pixi_passthrough.get("system-requirements")
+438-    if sys_reqs:
+439-        feat["system-requirements"] = copy.deepcopy(sys_reqs)
+440-
+441-    # [activation]: MERGE (ADR-0013) -- author entries pass through; the
+442-    # compiler's own key wins only on direct collision. Assigning the block
+443-    # outright silently clobbers author activation.
+444-    activation = copy.deepcopy(cfg.pixi_passthrough.get("activation", {}))
+445-    if not isinstance(activation, dict):
+446-        activation = {}
+447-    act_env = activation.setdefault("env", {})
+448-    act_env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+449-    feat["activation"] = activation
+450-
+451-    # Honest passthrough (ADR-0013): every remaining table is forwarded
+452-    # verbatim at the feature level ([tasks], future pixi tables, ...).
+453-    # pixi validates its own language; comfy-env does not chase its schema.
+454-    for key, value in cfg.pixi_passthrough.items():
+455-        if key in _HANDLED_PASSTHROUGH or key in _DENIED_PASSTHROUGH:
+456-            continue
+457-        feat[key] = copy.deepcopy(value)
+458-        log(f"[comfy-env] {name}: passthrough [{key}] -> feature")
+459-    return feat
+460-
+461-
+462-def _torch_family_pins(
+463-    torch_pin: Optional[str],
+464-    log: Callable[[str], None],
+465-) -> Optional[Dict[str, str]]:
+466-    """Return {torch: <pin>, torchvision: <pin>, torchaudio: <pin>} from TORCH_FAMILY_COMPAT.
+467-
+468-    Returns None when `torch_pin` is None. Returns a partial map (`{"torch": pin}` only)
+469-    when torch's minor isn't in the compat table, with a warning logged.
+470-    """
+471-    if not torch_pin:
+472-        return None
+473-    from .cuda_wheels import derive_family_pins
+474-    family = derive_family_pins(torch_pin)
+475-    if family is None:
+476-        log(
+477-            f"[comfy-env] WARNING: torch_pin {torch_pin} not in TORCH_FAMILY_COMPAT; "
+478-            f"pinning torch only, leaving torchvision/torchaudio unpinned"
+479-        )
+===== cuda_wheels.py =====
+"""CUDA wheels index integration. See: https://pozzettiandrea.github.io/cuda-wheels/"""
+
+import json
+import logging
+import re
+import socket
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+from typing import Callable, List, Optional
+
+from ..detection.arch import cpu_arch
+
+try:
+    from importlib.metadata import version as _pkg_version
+    _UA = f"comfy-env/{_pkg_version('comfy-env')}"
+except Exception:
+    _UA = "comfy-env/unknown"
+
+logger = logging.getLogger("comfy-env.cuda-wheels")
+
+CUDA_WHEELS_INDEX_DEFAULT = "https://comfy-forge.github.io/cuda-wheels/"
+
+
+def cuda_wheels_index() -> str:
+    """The cuda-wheels index base URL, with a trailing slash.
+
+    Override with the ``COMFY_ENV_CUDA_WHEELS_INDEX`` environment variable.
+    The point is mirrors: an air-gapped or bandwidth-limited site can serve
+    the same directory listing from its own host without patching comfy-env.
+
+    Resolved per call rather than frozen at import so a test or a caller can
+    change it without reloading the module.
+
+    !! This URL is a TRUST boundary. What it serves is inlined into the
+    generated pixi manifest as a direct-URL pypi-dependency and installed by
+    pixi into the isolated env, where it executes at import time. It is
+    hash-verified only where the index attaches a ``#sha256=`` fragment to
+    the link (``toml_generator._resolve_cuda_wheels`` preserves the fragment;
+    it does not invent one). Point it only at an index you control or trust
+    as much as the default (ADR-0026).
+    """
+    import os
+    raw = (os.environ.get("COMFY_ENV_CUDA_WHEELS_INDEX") or "").strip()
+    if not raw:
+        return CUDA_WHEELS_INDEX_DEFAULT
+    # Every call site does f"{index}{pkg}/", so a missing trailing slash would
+    # silently build ".../v2flash_attn/" instead of failing.
+    return raw if raw.endswith("/") else raw + "/"
+
+
+# Back-compat alias for readers that want the default without calling.
+CUDA_WHEELS_INDEX = CUDA_WHEELS_INDEX_DEFAULT
+
+
+def _ssl_context() -> Optional[ssl.SSLContext]:
+    """Build an SSL context using certifi's CA bundle when available.
+
+    Portable/embedded Python distributions (e.g. ComfyUI's python_embeded) often ship
+    without a complete CA store, which makes urllib fail with CERTIFICATE_VERIFY_FAILED
+    against hosts whose chain isn't in the stripped default store (notably GitHub Pages).
+    certifi is effectively always present (pip depends on it), so prefer it when we can.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return None
+
+# Tier-2 fallback combo. Only consulted by the install pipeline (see
+# install._resolve_wheel_combo) when the host's bootstrap (python, cuda, torch)
+# combo doesn't have every required cuda-wheel published. Keep this aligned with
+# the cuda-wheels build matrix's known-good baseline.
+CUDA_TORCH_MAP = {"12.8": "2.8", "12.4": "2.4"}
+FALLBACK_COMBO = ("12.8", "2.8")  # (cuda, torch) -- always paired with bootstrap python
+
+# ...except on linux aarch64, which is a different world and gets its own cell.
+# Three things rule out simply reusing the x86 combo, or nudging one axis of it:
+#
+#   * (12.8, 2.8) does not exist on ARM. PyTorch shipped no linux-aarch64 wheel
+#     for the whole 2.8 line on cu128 -- torch 2.8.0, torchvision 0.23.0 and
+#     torchaudio 2.8.0 are x86_64/win_amd64 only there. The aarch64 cu128 build
+#     broke during the 2.8 cycle (pytorch#157548) and came back for 2.9.
+#   * (13.0, 2.8) does not exist anywhere: PyTorch's CUDA 13 line starts at
+#     torch 2.9, so 2.8 cannot reach it on any platform.
+#   * Staying on 12.8/12.9 leaves Thor DEAD. Their ARM arch list is
+#     `8.0;9.0+PTX;10.0;12.0+PTX` -- sm_110 has no cubin at or below it (the
+#     10.0 cubin cannot cross a major, the 12.0 PTX is above), so a Thor gets
+#     cudaErrorNoKernelImageForDevice at first kernel launch. 13.0's ARM list
+#     adds 11.0 natively.
+#
+# So ARM takes (13.0, 2.10): every current ARM CUDA product is covered (Grace
+# sm_90, GB200 sm_100, Thor sm_110, Orin sm_87 via the 8.0 cubin), and from
+# torchvision 0.25 / torchaudio 2.10 the ARM wheels are CUDA-tagged (+cu130)
+# rather than the plain CPU-only builds cu128/cu129 carry at that torch level.
+# Cost, stated plainly: CUDA 13 needs driver r580+.
+FALLBACK_COMBO_AARCH64 = ("13.0", "2.10")
+
+# Backend -> wheel-index registry. Data, not an `if backend ==`: callers go
+# through resolve_index_url(backend) rather than hardcoding an index.
+WHEEL_INDEX_REGISTRY: dict[str, dict] = {
+    "cuda": {
+        # Resolved lazily via resolve_index_url() -- see cuda_wheels_index().
+        "index": None,
+        # Keyed by CPU arch: the fallback is a claim about published wheels, and
+        # what upstream publishes differs per architecture.
+        "fallback_combo": {
+            "x86_64": FALLBACK_COMBO,
+            "aarch64": FALLBACK_COMBO_AARCH64,
+        },
+    },
+    # "rocm": {"index": ROCM_WHEELS_INDEX, "fallback_combo": (...)},  # additive later
+}
+
+
+def resolve_index_url(backend: str = "cuda") -> str:
+    """Wheel-index base URL for a backend. Raises for an unregistered backend."""
+    try:
+        WHEEL_INDEX_REGISTRY[backend]          # membership check
+        if backend == "cuda":
+            return cuda_wheels_index()
+        return WHEEL_INDEX_REGISTRY[backend]["index"]
+    except KeyError:
+        raise ValueError(
+            f"no wheel index registered for backend {backend!r}; "
+            f"known: {sorted(WHEEL_INDEX_REGISTRY)}"
+        ) from None
+
+
+def resolve_fallback_combo(backend: str = "cuda", arch: Optional[str] = None) -> tuple:
+    """Tier-2 (toolkit, torch) fallback combo for a backend on this machine's CPU.
+
+    `arch` overrides the detected architecture (for tests); it must be one of
+    the keys registered for the backend.
+    """
+    try:
+        combos = WHEEL_INDEX_REGISTRY[backend]["fallback_combo"]
+    except KeyError:
+        raise ValueError(f"no fallback combo registered for backend {backend!r}") from None
+    arch = arch or cpu_arch()
+    try:
+        return combos[arch]
+    except KeyError:
+        raise ValueError(
+            f"no {backend} fallback combo registered for CPU arch {arch!r}; "
+            f"known: {sorted(combos)}"
+        ) from None
+
+# torch.minor -> (torchvision_minor, torchaudio_minor). Used as a fallback
+# when the bootstrap venv doesn't have torchvision/torchaudio installed
+# (bare-env cases). For Desktop / any bootstrap that already has the family
+# installed, `derive_family_pins` reads the actual installed versions instead
+# — auto-tracks decouplings like torch 2.12 shipping without a matching
+# torchaudio (latest torchaudio for that torch line is 2.11).
+TORCH_FAMILY_COMPAT: dict = {
+    "2.4":  ("0.19", "2.4"),
+    "2.5":  ("0.20", "2.5"),
+    "2.6":  ("0.21", "2.6"),
+    "2.7":  ("0.22", "2.7"),
+    "2.8":  ("0.23", "2.8"),
+    "2.9":  ("0.24", "2.9"),
+    "2.10": ("0.25", "2.10"),
+    "2.11": ("0.26", "2.11"),
+    "2.12": ("0.27", "2.11"),   # torchaudio never shipped 2.12; stuck at 2.11
+}
+
+
+def derive_family_pins(torch_pin: str) -> Optional[tuple]:
+    """Given a torch pin like '==2.11.0' or '==2.8.*', return
+    `(torchvision_pin, torchaudio_pin)` as `==X.Y.*` specs.
+
+    Prefers the bootstrap venv's actually-installed versions when torch_pin
+    matches bootstrap torch — auto-tracks releases like the missing
+    torchaudio 2.12 without needing a table update. Falls back to
+    `TORCH_FAMILY_COMPAT` otherwise (bare envs, cuda-wheel-resolver
+    fallback combos that differ from bootstrap, etc).
+    """
+    m = re.match(r"==\s*(\d+)\.(\d+)", torch_pin)
+    if not m:
+        return None
+    minor_key = f"{m.group(1)}.{m.group(2)}"
+
+    # Bootstrap-derived: authoritative when torch_pin matches bootstrap.
+    try:
+        from ..detection.cuda import (
+            get_bootstrap_torch_version,
+            get_bootstrap_torchvision_version,
+            get_bootstrap_torchaudio_version,
+        )
+        bt_torch = get_bootstrap_torch_version()
+        if bt_torch and bt_torch.startswith(f"{minor_key}."):
+            bt_vision = get_bootstrap_torchvision_version()
+            bt_audio = get_bootstrap_torchaudio_version()
+            if bt_vision and bt_audio:
+                v_mm = ".".join(bt_vision.split(".")[:2])
+                a_mm = ".".join(bt_audio.split(".")[:2])
+                return (f"=={v_mm}.*", f"=={a_mm}.*")
+    except Exception:
+        pass
+
+    pair = TORCH_FAMILY_COMPAT.get(minor_key)
+    if not pair:
+        return None
+    vision_minor, audio_minor = pair
+    return (f"=={vision_minor}.*", f"=={audio_minor}.*")
+
+
+def check_all_wheels_available(packages: List[str], torch_version: str,
+                               cuda_version: str, python_version: str,
+                               log: Optional[Callable[[str], None]] = None) -> Optional[str]:
+    """Check if all required cuda-wheels are available for this CUDA+torch combo.
+
+    Returns None if all packages have wheels, or the name of the first missing package.
+    If `log` is provided, lookup progress and failure reasons are surfaced to the caller's
+    log stream (the cuda_wheels logger is not wired to install logs by default).
+    """
+    for package in packages:
+        url = get_wheel_url(package, torch_version, cuda_version, python_version, log=log)
+        if not url:
+            return package
+    return None
+
+
+def _pkg_variants(package: str) -> List[str]:
+    return [package, package.replace("-", "_"), package.replace("_", "-")]
+
+
+def _platform_tags() -> List[str]:
+    """Substrings a wheel filename must contain to be installable on THIS machine.
+
+    The CPU architecture is load-bearing here, not a detail. Matching on bare
+    "manylinux" accepts `...-manylinux_2_34_x86_64.whl` on an ARM host, so the
+    probe reports the package as published, the combo resolves, and pip only
+    refuses it later ("is not a supported wheel on this platform") -- a quiet
+    failure a long way from its cause. Every wheel platform tag ends in the
+    arch, for both the manylinux and the plain linux spellings, so matching the
+    `_<arch>` suffix covers both and excludes the other architecture.
+    """
+    if sys.platform.startswith("linux"):
+        return [f"_{cpu_arch()}"]
+    if sys.platform == "win32":
+        return ["win_amd64"]
+    return []
+
+
+_TRANSIENT_NET_ERRORS = (ConnectionResetError, socket.timeout, TimeoutError)
+
+
+def _fetch_with_retries(url: str, timeout: int = 10, max_retries: int = 3,
+                        log: Optional[Callable[[str], None]] = None) -> str:
+    """Fetch `url` with a real User-Agent and exponential-backoff retries on
+    transient transport errors. Non-transient HTTP errors (4xx/5xx) are raised
+    immediately. Default Python urllib UA gets RST by some corporate proxies
+    and AV middleboxes, so we always send `comfy-env/<version>`.
+    """
+    backoff = (1, 2, 4)
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": _UA})
+            with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+                return resp.read().decode("utf-8")
+        except urllib.error.HTTPError:
+            raise
+        except urllib.error.URLError as e:
+            if not isinstance(e.reason, _TRANSIENT_NET_ERRORS):
+                raise
+            last_err = e
+        except _TRANSIENT_NET_ERRORS as e:
+            last_err = e
+        if attempt < max_retries - 1:
+            sleep_s = backoff[attempt]
+            if log is not None:
+                log(f"[cuda-wheels]   retry {attempt+1}/{max_retries} after {sleep_s}s ({type(last_err).__name__})")
+            time.sleep(sleep_s)
+    raise last_err
+
+
+def _fetch_from_github_api(package: str, torch_version: str, cuda_version: str,
+                           python_version: str,
+                           log: Optional[Callable[[str], None]] = None) -> Optional[tuple]:
+    """Fallback when the GH Pages index is unreachable: list release assets
+    via `api.github.com/repos/Comfy-Forge/cuda-wheels/releases` and match
+    by the same filename pattern. Different routing edge than Pages, so often
+    works when Fastly is RST-ing the Pages host. Returns `(url, name)` or None.
+    """
+    cuda_short = cuda_version.replace(".", "")[:3]
+    torch_short = ".".join(torch_version.split(".")[:2])
+    py_tag = f"cp{python_version.replace('.', '')}"
+    platform_tags = _platform_tags()
+    local_patterns = [f"+cu{cuda_short}torch{torch_short}", f"+pt{torch_short}cu{cuda_short}"]
+    pkg_variants_set = set(_pkg_variants(package))
+
+    api_url = "https://api.github.com/repos/Comfy-Forge/cuda-wheels/releases?per_page=100"
+    try:
+        body = _fetch_with_retries(api_url, timeout=15, log=log)
+    except Exception as e:
+        if log is not None:
+            log(f"[cuda-wheels]   GitHub Releases API: {type(e).__name__}: {e}")
+        return None
+    try:
+        releases = json.loads(body)
+    except Exception:
+        return None
+
+    candidates = []
+    for release in releases:
+        for asset in release.get("assets", ()):
+            name = asset.get("name", "")
+            wheel_pkg = name.split("-", 1)[0] if "-" in name else ""
+            if wheel_pkg not in pkg_variants_set:
+                continue
+            if not any(p in name for p in local_patterns):
+                continue
+            if py_tag not in name:
+                continue
+            if platform_tags and not any(t in name for t in platform_tags):
+                continue
+===== GPU/Backend Detection =====
+src/comfy_env/detection/__init__.py
+src/comfy_env/detection/backend.py
+src/comfy_env/detection/cuda.py
+src/comfy_env/detection/gpu.py
+src/comfy_env/detection/arch.py
+src/comfy_env/detection/__init__.py:11:from .cuda import (
+src/comfy_env/detection/__init__.py:12:    has_nvidia_gpu,
+src/comfy_env/detection/__init__.py:13:    detect_cuda_version,
+src/comfy_env/detection/__init__.py:16:    get_bootstrap_torch_cuda,
+src/comfy_env/detection/__init__.py:20:    CUDAEnvironment,
+src/comfy_env/detection/__init__.py:24:    detect_cuda_environment,
+src/comfy_env/detection/__init__.py:27:    get_recommended_cuda_version,
+src/comfy_env/detection/__init__.py:65:    # CUDA detection
+src/comfy_env/detection/__init__.py:66:    "has_nvidia_gpu",
+src/comfy_env/detection/__init__.py:67:    "detect_cuda_version",
+src/comfy_env/detection/__init__.py:70:    "get_bootstrap_torch_cuda",
+src/comfy_env/detection/__init__.py:73:    "CUDAEnvironment",
+src/comfy_env/detection/__init__.py:77:    "detect_cuda_environment",
+src/comfy_env/detection/__init__.py:80:    "get_recommended_cuda_version",
+src/comfy_env/detection/backend.py:4:(e.g. '2.5.0+cu128' -> cuda, '2.4.0+rocm6.2' -> rocm, '2.5.0+xpu' -> xpu). That
+src/comfy_env/detection/backend.py:5:label -- not nvidia-smi or the system driver -- is what determines wheel
+src/comfy_env/detection/backend.py:8:Only 'cuda' and 'cpu' are wired end-to-end today. 'rocm'/'xpu'/'mps' are named so
+src/comfy_env/detection/backend.py:11:fixes the prior misdetection: a ROCm torch has torch.cuda.is_available() == True
+src/comfy_env/detection/backend.py:12:but torch.version.cuda is None, so the cuda-only `+cuXXX` parse read it as CPU
+src/comfy_env/detection/backend.py:13:while the torch GPU probe reported a bogus NVIDIA arch.
+src/comfy_env/detection/backend.py:15:detection/cuda.py + detection/gpu.py remain the CUDA-specific probes -- they are
+src/comfy_env/detection/backend.py:16:the 'cuda' branch callers use when detect_backend() returns 'cuda'.
+src/comfy_env/detection/backend.py:23:from .cuda import get_bootstrap_torch_cuda
+src/comfy_env/detection/backend.py:25:# Backends this project knows how to name. Wired end-to-end: cuda, cpu.
+src/comfy_env/detection/backend.py:26:KNOWN_BACKENDS = ("cuda", "rocm", "xpu", "mps", "cpu")
+src/comfy_env/detection/backend.py:30:    """Local part of the installed torch version (e.g. 'cu128', 'rocm6.2', 'xpu'),
+src/comfy_env/detection/backend.py:54:    where meaningful (cuda '12.8', rocm '6.2'), else None.
+src/comfy_env/detection/backend.py:58:        if label.startswith("rocm"):
+src/comfy_env/detection/backend.py:59:            return ("rocm", label[len("rocm"):] or None)
+src/comfy_env/detection/backend.py:61:            # CUDA version parsing lives in detection/cuda.py (the cuda branch).
+src/comfy_env/detection/backend.py:62:            return ("cuda", get_bootstrap_torch_cuda())
+src/comfy_env/detection/cuda.py:8:def has_nvidia_gpu() -> bool:
+src/comfy_env/detection/cuda.py:9:    """Check if NVIDIA GPU is present."""
+src/comfy_env/detection/cuda.py:10:    return detect_cuda_version() is not None
+src/comfy_env/detection/cuda.py:14:def detect_cuda_version() -> str | None:
+src/comfy_env/detection/cuda.py:15:    """Detect system CUDA version. Priority: pixi -> torch metadata.
+src/comfy_env/detection/cuda.py:21:    if pixi_cuda := _get_cuda_from_pixi():
+src/comfy_env/detection/cuda.py:22:        return pixi_cuda
+src/comfy_env/detection/cuda.py:23:    return get_bootstrap_torch_cuda()
+src/comfy_env/detection/cuda.py:26:def _get_cuda_from_pixi() -> str | None:
+src/comfy_env/detection/cuda.py:27:    """Get CUDA version from pixi's virtual package detection."""
+src/comfy_env/detection/cuda.py:36:            if vp.startswith("__cuda="):
+src/comfy_env/detection/cuda.py:114:def get_bootstrap_torch_cuda() -> str | None:
+src/comfy_env/detection/cuda.py:115:    """CUDA version the host torch was built against (e.g. '12.8').
+src/comfy_env/detection/gpu.py:1:"""GPU detection. Methods: NVML -> PyTorch -> nvidia-smi -> sysfs"""
+src/comfy_env/detection/gpu.py:11:from .cuda import detect_cuda_version
+src/comfy_env/detection/gpu.py:22:_cache: tuple[float, "CUDAEnvironment | None"] = (0, None)
+src/comfy_env/detection/gpu.py:43:class CUDAEnvironment:
+src/comfy_env/detection/gpu.py:46:    cuda_runtime_version: str = ""
+src/comfy_env/detection/gpu.py:47:    recommended_cuda: str = ""
+src/comfy_env/detection/gpu.py:63:    env = detect_cuda_environment()
+src/comfy_env/detection/gpu.py:67:def get_recommended_cuda_version(gpus: list[GPUInfo] | None = None) -> str:
+src/comfy_env/detection/gpu.py:70:    linux aarch64 is a different world and always gets 13.0. PyTorch's ARM CUDA
+src/comfy_env/detection/gpu.py:74:    branch below can never be satisfiable there. 12.4 is doubly wrong: NVIDIA's
+src/comfy_env/detection/gpu.py:75:    sbsa apt repo starts at 12.5, so cuda-wheels deliberately does not build it
+src/comfy_env/detection/gpu.py:79:    # Skip GPU detection on explicit CPU test runners (avoids torch import/CUDA warning)
+src/comfy_env/detection/gpu.py:83:    if cuda := detect_cuda_version():
+src/comfy_env/detection/gpu.py:84:        return cuda
+src/comfy_env/detection/gpu.py:86:    gpus = gpus if gpus is not None else detect_cuda_environment().gpus
+src/comfy_env/detection/gpu.py:102:    env = detect_cuda_environment()
+src/comfy_env/detection/gpu.py:107:    return detect_cuda_environment().gpus
+src/comfy_env/detection/gpu.py:110:def detect_cuda_environment(force_refresh: bool = False) -> CUDAEnvironment:
+src/comfy_env/detection/gpu.py:116:    # On Windows, try nvidia-smi first (subprocess, crash-safe) before torch/nvml
+src/comfy_env/detection/gpu.py:129:    env = CUDAEnvironment(
+src/comfy_env/detection/gpu.py:131:        cuda_runtime_version=_get_cuda_version(),
+src/comfy_env/detection/gpu.py:132:        recommended_cuda=get_recommended_cuda_version(gpus or []), detection_method=method,
+src/comfy_env/detection/gpu.py:139:    env = detect_cuda_environment()
+src/comfy_env/detection/gpu.py:145:    if env.cuda_runtime_version: lines.append(f"CUDA: {env.cuda_runtime_version}")
+src/comfy_env/detection/gpu.py:146:    lines.append(f"Recommended: CUDA {env.recommended_cuda}")
+src/comfy_env/detection/gpu.py:174:                cc = pynvml.nvmlDeviceGetCudaComputeCapability(h)
+src/comfy_env/detection/gpu.py:187:        if not torch.cuda.is_available(): return None
+src/comfy_env/detection/gpu.py:189:        for i in range(torch.cuda.device_count()):
+src/comfy_env/detection/gpu.py:190:            p = torch.cuda.get_device_properties(i)
+src/comfy_env/detection/gpu.py:201:            ["nvidia-smi", "--query-gpu=index,name,uuid,pci.bus_id,compute_cap,memory.total,memory.free,driver_version",
+src/comfy_env/detection/gpu.py:229:            gpus.append(GPUInfo(len(gpus), "NVIDIA GPU", (0, 0), "Unknown", pci_bus_id=d.name))
+src/comfy_env/detection/gpu.py:235:    # On Windows, try nvidia-smi first (crash-safe) before pynvml
+src/comfy_env/detection/gpu.py:239:            r = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+src/comfy_env/detection/gpu.py:252:            r = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+src/comfy_env/detection/gpu.py:259:def _get_cuda_version() -> str:
+src/comfy_env/detection/gpu.py:260:    # Use nvidia-smi (subprocess, crash-safe) instead of torch import
+src/comfy_env/detection/gpu.py:263:        r = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=5)
+src/comfy_env/detection/gpu.py:266:                if "CUDA Version" in line:
+src/comfy_env/detection/gpu.py:267:                    return line.split("CUDA Version:")[1].strip().split()[0]
+===== ROCm/CUDA Referenzen im gesamten Projekt =====
+src/comfy_env/install/workspace.py:70:    cpu_index = "https://download.pytorch.org/whl/cpu"
+src/comfy_env/install/workspace.py:129:    torch_index = f"https://download.pytorch.org/whl/{cu_tag}"
+src/comfy_env/install/workspace.py:758:                f"https://download.pytorch.org/whl/cu"
+src/comfy_env/packages/cuda_wheels.py:114:    # "rocm": {"index": ROCM_WHEELS_INDEX, "fallback_combo": (...)},  # additive later
+src/comfy_env/isolation/metadata.py:310:_ACCEL_VOCAB = ("cuda", "rocm", "xpu", "mps")
+src/comfy_env/isolation/metadata.py:397:        # "cuda" / "rocm" / "xpu" / "mps", or None. Meaning: the node
+src/comfy_env/isolation/metadata.py:1836:    """Detected torch backend of THIS machine ("cuda"/"rocm"/"mps"/"cpu"...), cached."""
+src/comfy_env/environment/cache.py:138:        elif backend == "rocm" and ver:
+src/comfy_env/environment/cache.py:139:            parts.append("rocm" + ver.replace(".", ""))
+src/comfy_env/detection/backend.py:4:(e.g. '2.5.0+cu128' -> cuda, '2.4.0+rocm6.2' -> rocm, '2.5.0+xpu' -> xpu). That
+src/comfy_env/detection/backend.py:8:Only 'cuda' and 'cpu' are wired end-to-end today. 'rocm'/'xpu'/'mps' are named so
+src/comfy_env/detection/backend.py:11:fixes the prior misdetection: a ROCm torch has torch.cuda.is_available() == True
+src/comfy_env/detection/backend.py:26:KNOWN_BACKENDS = ("cuda", "rocm", "xpu", "mps", "cpu")
+src/comfy_env/detection/backend.py:30:    """Local part of the installed torch version (e.g. 'cu128', 'rocm6.2', 'xpu'),
+src/comfy_env/detection/backend.py:54:    where meaningful (cuda '12.8', rocm '6.2'), else None.
+src/comfy_env/detection/backend.py:58:        if label.startswith("rocm"):
+src/comfy_env/detection/backend.py:59:            return ("rocm", label[len("rocm"):] or None)
+tests/test_wheels_index_override.py:56:    with pytest.raises(ValueError, match="rocm"):
+tests/test_wheels_index_override.py:57:        cw.resolve_index_url("rocm")
+tests/test_cuda_wheels.py:86:    with pytest.raises(ValueError, match="rocm"):
+tests/test_cuda_wheels.py:87:        cw.resolve_fallback_combo("rocm")
+tests/test_accelerator_decl.py:115:    # A node that runs on Metal but not ROCm says so, and is served on mps.
+tests/test_accelerator_decl.py:118:    assert not md._accelerator_available(["cuda", "rocm"])
+tests/test_memory_manager.py:219:    CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
+tests/test_toml_generator.py:13:        torch_index="https://download.pytorch.org/whl/cpu",
+tests/test_toml_generator.py:58:        pypi = self._pypi(monkeypatch, "https://download.pytorch.org/whl/cu128")
+tests/test_toml_generator.py:62:        pypi = self._pypi(monkeypatch, "https://download.pytorch.org/whl/cu128")
+tests/test_toml_generator.py:70:        pypi = self._pypi(monkeypatch, "https://download.pytorch.org/whl/cpu")
