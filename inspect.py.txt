@@ -1,0 +1,1411 @@
+=== comfy-env ===
+Version: 0.4.46
+
+=== gpu.py ===
+/home/paladx2105/.trellis2/venv/lib/python3.12/site-packages/comfy_env/detection/gpu.py
+
+=== get_recommended_cuda_version() ===
+def get_recommended_cuda_version(gpus: list[GPUInfo] | None = None) -> str:
+    """x86_64 -- Blackwell: 12.8, pre-Turing: 12.4, others: 12.8.
+
+    linux aarch64 is a different world and always gets 13.0. PyTorch's ARM CUDA
+    builds compile a much shorter arch list than the x86 ones -- `{8.0, 9.0}` on
+    cu126 and `{8.0, 9.0, 10.0, 12.0}` on cu128/cu129, against x86's `{5.0 ...
+    12.0}` -- so sm_70 and sm_75 do not exist on ARM at all and the pre-Turing
+    branch below can never be satisfiable there. 12.4 is doubly wrong: NVIDIA's
+    sbsa apt repo starts at 12.5, so cuda-wheels deliberately does not build it
+    for ARM (arch_policy_aarch64). 13.0 because it is the only line whose ARM
+    arch list carries Thor (sm_110) natively -- see FALLBACK_COMBO_AARCH64.
+    """
+    # Skip GPU detection on explicit CPU test runners (avoids torch import/CUDA warning)
+    if os.environ.get("COMFY_TEST_GPU") == "0":
+        return ""
+
+    if cuda := detect_cuda_version():
+        return cuda
+
+    gpus = gpus if gpus is not None else detect_cuda_environment().gpus
+    if not gpus: return ""
+
+    from .arch import cpu_arch
+    if cpu_arch() == "aarch64":
+        return "13.0"
+
+    for gpu in gpus:
+        if gpu.compute_capability[0] >= 10: return "12.8"
+    for gpu in gpus:
+        cc = gpu.compute_capability
+        if cc[0] < 7 or (cc[0] == 7 and cc[1] < 5): return "12.4"
+    return "12.8"
+
+
+=== workspace.py ===
+/home/paladx2105/.trellis2/venv/lib/python3.12/site-packages/comfy_env/install/workspace.py
+
+--- workspace lines 41-95 ---
+
+
+# Bootstrap probing & node discovery
+
+def _resolve_workspace_torch(
+    log: Callable[[str], None],
+) -> Tuple[Optional[str], Optional[str], Optional[str], str, Optional[str]]:
+    """Decide (torch_index, cuda_version, cuda_major, python_version, torch_version)
+    once for the whole workspace.
+
+    `cuda_version` is the full string (e.g. "12.4"), used by `get_wheel_url`.
+    `cuda_major` is just the leading digit (e.g. "12"), used in `[system-requirements]`.
+    `python_version` is the bootstrap interpreter's MAJOR.MINOR (e.g. "3.10").
+    `torch_version` is the bootstrap's torch.__version__ (public part), or None
+    if torch isn't importable from bootstrap (then the comfyui feature stays
+    `torch = "*"` and the cuda-wheel picker reads the actual version from the
+    materialized template env post-install).
+
+    macOS: (None, None, None, py, torch) -- pixi falls through to default PyPI
+    which has osx-arm64/osx-64 torch wheels. Linux/Windows + NVIDIA: cu* index
+    + version. Linux/Windows without GPU: (cpu_index, None, None, py, torch).
+    """
+    from ..detection import (
+        get_recommended_cuda_version,
+        get_gpu_summary,
+        get_bootstrap_python_version,
+        get_bootstrap_torch_version,
+        get_bootstrap_torch_cuda,
+    )
+    cpu_index = "https://download.pytorch.org/whl/cpu"
+    python_version = get_bootstrap_python_version()
+    torch_version = get_bootstrap_torch_version()
+    bootstrap_cuda = get_bootstrap_torch_cuda()
+
+    # Portable ComfyUI ships torch+cu128 inside python_embeded, so bootstrap_cuda
+    # is "12.8" even on a hosted runner with no NVIDIA driver. Treat it as
+    # CPU-only when no GPU is actually present -- otherwise pixi installs cu*
+    # wheels into every env and `import torch` later dies with WinError 127
+    # (or its Linux equivalent) trying to load shm.dll / libtorch_cuda.so.
+    from ..detection.cuda import has_nvidia_gpu
+    if bootstrap_cuda and not has_nvidia_gpu():
+        log(
+            f"[comfy-env] Bootstrap torch is cu{bootstrap_cuda.replace('.', '')[:3]} "
+            f"but no NVIDIA GPU detected -- ignoring cuda tag, using CPU index"
+        )
+        bootstrap_cuda = None
+
+    cu_tag_bootstrap = (
+        f"cu{bootstrap_cuda.replace('.', '')}" if bootstrap_cuda else "cpu"
+    )
+    py_short = python_version.replace(".", "") if python_version else "?"
+    if torch_version:
+        log(
+            f"[comfy-env] Bootstrap interpreter has python {python_version} + "
+            f"torch {torch_version} ({cu_tag_bootstrap}). Looking for cuda-only "
+
+--- workspace lines 44-98 ---
+
+def _resolve_workspace_torch(
+    log: Callable[[str], None],
+) -> Tuple[Optional[str], Optional[str], Optional[str], str, Optional[str]]:
+    """Decide (torch_index, cuda_version, cuda_major, python_version, torch_version)
+    once for the whole workspace.
+
+    `cuda_version` is the full string (e.g. "12.4"), used by `get_wheel_url`.
+    `cuda_major` is just the leading digit (e.g. "12"), used in `[system-requirements]`.
+    `python_version` is the bootstrap interpreter's MAJOR.MINOR (e.g. "3.10").
+    `torch_version` is the bootstrap's torch.__version__ (public part), or None
+    if torch isn't importable from bootstrap (then the comfyui feature stays
+    `torch = "*"` and the cuda-wheel picker reads the actual version from the
+    materialized template env post-install).
+
+    macOS: (None, None, None, py, torch) -- pixi falls through to default PyPI
+    which has osx-arm64/osx-64 torch wheels. Linux/Windows + NVIDIA: cu* index
+    + version. Linux/Windows without GPU: (cpu_index, None, None, py, torch).
+    """
+    from ..detection import (
+        get_recommended_cuda_version,
+        get_gpu_summary,
+        get_bootstrap_python_version,
+        get_bootstrap_torch_version,
+        get_bootstrap_torch_cuda,
+    )
+    cpu_index = "https://download.pytorch.org/whl/cpu"
+    python_version = get_bootstrap_python_version()
+    torch_version = get_bootstrap_torch_version()
+    bootstrap_cuda = get_bootstrap_torch_cuda()
+
+    # Portable ComfyUI ships torch+cu128 inside python_embeded, so bootstrap_cuda
+    # is "12.8" even on a hosted runner with no NVIDIA driver. Treat it as
+    # CPU-only when no GPU is actually present -- otherwise pixi installs cu*
+    # wheels into every env and `import torch` later dies with WinError 127
+    # (or its Linux equivalent) trying to load shm.dll / libtorch_cuda.so.
+    from ..detection.cuda import has_nvidia_gpu
+    if bootstrap_cuda and not has_nvidia_gpu():
+        log(
+            f"[comfy-env] Bootstrap torch is cu{bootstrap_cuda.replace('.', '')[:3]} "
+            f"but no NVIDIA GPU detected -- ignoring cuda tag, using CPU index"
+        )
+        bootstrap_cuda = None
+
+    cu_tag_bootstrap = (
+        f"cu{bootstrap_cuda.replace('.', '')}" if bootstrap_cuda else "cpu"
+    )
+    py_short = python_version.replace(".", "") if python_version else "?"
+    if torch_version:
+        log(
+            f"[comfy-env] Bootstrap interpreter has python {python_version} + "
+            f"torch {torch_version} ({cu_tag_bootstrap}). Looking for cuda-only "
+            f"wheels matching {cu_tag_bootstrap}/torch{torch_version.rsplit('.', 1)[0]}/cp{py_short}."
+        )
+    else:
+
+--- workspace lines 50-104 ---
+
+    `cuda_version` is the full string (e.g. "12.4"), used by `get_wheel_url`.
+    `cuda_major` is just the leading digit (e.g. "12"), used in `[system-requirements]`.
+    `python_version` is the bootstrap interpreter's MAJOR.MINOR (e.g. "3.10").
+    `torch_version` is the bootstrap's torch.__version__ (public part), or None
+    if torch isn't importable from bootstrap (then the comfyui feature stays
+    `torch = "*"` and the cuda-wheel picker reads the actual version from the
+    materialized template env post-install).
+
+    macOS: (None, None, None, py, torch) -- pixi falls through to default PyPI
+    which has osx-arm64/osx-64 torch wheels. Linux/Windows + NVIDIA: cu* index
+    + version. Linux/Windows without GPU: (cpu_index, None, None, py, torch).
+    """
+    from ..detection import (
+        get_recommended_cuda_version,
+        get_gpu_summary,
+        get_bootstrap_python_version,
+        get_bootstrap_torch_version,
+        get_bootstrap_torch_cuda,
+    )
+    cpu_index = "https://download.pytorch.org/whl/cpu"
+    python_version = get_bootstrap_python_version()
+    torch_version = get_bootstrap_torch_version()
+    bootstrap_cuda = get_bootstrap_torch_cuda()
+
+    # Portable ComfyUI ships torch+cu128 inside python_embeded, so bootstrap_cuda
+    # is "12.8" even on a hosted runner with no NVIDIA driver. Treat it as
+    # CPU-only when no GPU is actually present -- otherwise pixi installs cu*
+    # wheels into every env and `import torch` later dies with WinError 127
+    # (or its Linux equivalent) trying to load shm.dll / libtorch_cuda.so.
+    from ..detection.cuda import has_nvidia_gpu
+    if bootstrap_cuda and not has_nvidia_gpu():
+        log(
+            f"[comfy-env] Bootstrap torch is cu{bootstrap_cuda.replace('.', '')[:3]} "
+            f"but no NVIDIA GPU detected -- ignoring cuda tag, using CPU index"
+        )
+        bootstrap_cuda = None
+
+    cu_tag_bootstrap = (
+        f"cu{bootstrap_cuda.replace('.', '')}" if bootstrap_cuda else "cpu"
+    )
+    py_short = python_version.replace(".", "") if python_version else "?"
+    if torch_version:
+        log(
+            f"[comfy-env] Bootstrap interpreter has python {python_version} + "
+            f"torch {torch_version} ({cu_tag_bootstrap}). Looking for cuda-only "
+            f"wheels matching {cu_tag_bootstrap}/torch{torch_version.rsplit('.', 1)[0]}/cp{py_short}."
+        )
+    else:
+        # A Python with no torch is not a ComfyUI's: ComfyUI imports torch
+        # unconditionally, and a CPU-only ComfyUI still has a CPU torch. So
+        # this can only mean install.py was run with some other interpreter.
+        # An env built from it is keyed `py3XX-notorch` and stamped for a host
+        # that has no torch, which no real host ever is, so nothing can bind
+        # it -- a gigabyte of the wrong torch in a directory nothing will use.
+
+--- workspace lines 53-107 ---
+    `python_version` is the bootstrap interpreter's MAJOR.MINOR (e.g. "3.10").
+    `torch_version` is the bootstrap's torch.__version__ (public part), or None
+    if torch isn't importable from bootstrap (then the comfyui feature stays
+    `torch = "*"` and the cuda-wheel picker reads the actual version from the
+    materialized template env post-install).
+
+    macOS: (None, None, None, py, torch) -- pixi falls through to default PyPI
+    which has osx-arm64/osx-64 torch wheels. Linux/Windows + NVIDIA: cu* index
+    + version. Linux/Windows without GPU: (cpu_index, None, None, py, torch).
+    """
+    from ..detection import (
+        get_recommended_cuda_version,
+        get_gpu_summary,
+        get_bootstrap_python_version,
+        get_bootstrap_torch_version,
+        get_bootstrap_torch_cuda,
+    )
+    cpu_index = "https://download.pytorch.org/whl/cpu"
+    python_version = get_bootstrap_python_version()
+    torch_version = get_bootstrap_torch_version()
+    bootstrap_cuda = get_bootstrap_torch_cuda()
+
+    # Portable ComfyUI ships torch+cu128 inside python_embeded, so bootstrap_cuda
+    # is "12.8" even on a hosted runner with no NVIDIA driver. Treat it as
+    # CPU-only when no GPU is actually present -- otherwise pixi installs cu*
+    # wheels into every env and `import torch` later dies with WinError 127
+    # (or its Linux equivalent) trying to load shm.dll / libtorch_cuda.so.
+    from ..detection.cuda import has_nvidia_gpu
+    if bootstrap_cuda and not has_nvidia_gpu():
+        log(
+            f"[comfy-env] Bootstrap torch is cu{bootstrap_cuda.replace('.', '')[:3]} "
+            f"but no NVIDIA GPU detected -- ignoring cuda tag, using CPU index"
+        )
+        bootstrap_cuda = None
+
+    cu_tag_bootstrap = (
+        f"cu{bootstrap_cuda.replace('.', '')}" if bootstrap_cuda else "cpu"
+    )
+    py_short = python_version.replace(".", "") if python_version else "?"
+    if torch_version:
+        log(
+            f"[comfy-env] Bootstrap interpreter has python {python_version} + "
+            f"torch {torch_version} ({cu_tag_bootstrap}). Looking for cuda-only "
+            f"wheels matching {cu_tag_bootstrap}/torch{torch_version.rsplit('.', 1)[0]}/cp{py_short}."
+        )
+    else:
+        # A Python with no torch is not a ComfyUI's: ComfyUI imports torch
+        # unconditionally, and a CPU-only ComfyUI still has a CPU torch. So
+        # this can only mean install.py was run with some other interpreter.
+        # An env built from it is keyed `py3XX-notorch` and stamped for a host
+        # that has no torch, which no real host ever is, so nothing can bind
+        # it -- a gigabyte of the wrong torch in a directory nothing will use.
+        # Refuse here, before any disk is touched, and say what to run.
+        raise RuntimeError(
+            f"[comfy-env] The interpreter running this install (python "
+
+--- workspace lines 55-109 ---
+    if torch isn't importable from bootstrap (then the comfyui feature stays
+    `torch = "*"` and the cuda-wheel picker reads the actual version from the
+    materialized template env post-install).
+
+    macOS: (None, None, None, py, torch) -- pixi falls through to default PyPI
+    which has osx-arm64/osx-64 torch wheels. Linux/Windows + NVIDIA: cu* index
+    + version. Linux/Windows without GPU: (cpu_index, None, None, py, torch).
+    """
+    from ..detection import (
+        get_recommended_cuda_version,
+        get_gpu_summary,
+        get_bootstrap_python_version,
+        get_bootstrap_torch_version,
+        get_bootstrap_torch_cuda,
+    )
+    cpu_index = "https://download.pytorch.org/whl/cpu"
+    python_version = get_bootstrap_python_version()
+    torch_version = get_bootstrap_torch_version()
+    bootstrap_cuda = get_bootstrap_torch_cuda()
+
+    # Portable ComfyUI ships torch+cu128 inside python_embeded, so bootstrap_cuda
+    # is "12.8" even on a hosted runner with no NVIDIA driver. Treat it as
+    # CPU-only when no GPU is actually present -- otherwise pixi installs cu*
+    # wheels into every env and `import torch` later dies with WinError 127
+    # (or its Linux equivalent) trying to load shm.dll / libtorch_cuda.so.
+    from ..detection.cuda import has_nvidia_gpu
+    if bootstrap_cuda and not has_nvidia_gpu():
+        log(
+            f"[comfy-env] Bootstrap torch is cu{bootstrap_cuda.replace('.', '')[:3]} "
+            f"but no NVIDIA GPU detected -- ignoring cuda tag, using CPU index"
+        )
+        bootstrap_cuda = None
+
+    cu_tag_bootstrap = (
+        f"cu{bootstrap_cuda.replace('.', '')}" if bootstrap_cuda else "cpu"
+    )
+    py_short = python_version.replace(".", "") if python_version else "?"
+    if torch_version:
+        log(
+            f"[comfy-env] Bootstrap interpreter has python {python_version} + "
+            f"torch {torch_version} ({cu_tag_bootstrap}). Looking for cuda-only "
+            f"wheels matching {cu_tag_bootstrap}/torch{torch_version.rsplit('.', 1)[0]}/cp{py_short}."
+        )
+    else:
+        # A Python with no torch is not a ComfyUI's: ComfyUI imports torch
+        # unconditionally, and a CPU-only ComfyUI still has a CPU torch. So
+        # this can only mean install.py was run with some other interpreter.
+        # An env built from it is keyed `py3XX-notorch` and stamped for a host
+        # that has no torch, which no real host ever is, so nothing can bind
+        # it -- a gigabyte of the wrong torch in a directory nothing will use.
+        # Refuse here, before any disk is touched, and say what to run.
+        raise RuntimeError(
+            f"[comfy-env] The interpreter running this install (python "
+            f"{python_version}, {sys.executable}) has no torch, so it is not a "
+            f"ComfyUI's. Envs are keyed on the ComfyUI interpreter's python, "
+
+--- workspace lines 60-114 ---
+    which has osx-arm64/osx-64 torch wheels. Linux/Windows + NVIDIA: cu* index
+    + version. Linux/Windows without GPU: (cpu_index, None, None, py, torch).
+    """
+    from ..detection import (
+        get_recommended_cuda_version,
+        get_gpu_summary,
+        get_bootstrap_python_version,
+        get_bootstrap_torch_version,
+        get_bootstrap_torch_cuda,
+    )
+    cpu_index = "https://download.pytorch.org/whl/cpu"
+    python_version = get_bootstrap_python_version()
+    torch_version = get_bootstrap_torch_version()
+    bootstrap_cuda = get_bootstrap_torch_cuda()
+
+    # Portable ComfyUI ships torch+cu128 inside python_embeded, so bootstrap_cuda
+    # is "12.8" even on a hosted runner with no NVIDIA driver. Treat it as
+    # CPU-only when no GPU is actually present -- otherwise pixi installs cu*
+    # wheels into every env and `import torch` later dies with WinError 127
+    # (or its Linux equivalent) trying to load shm.dll / libtorch_cuda.so.
+    from ..detection.cuda import has_nvidia_gpu
+    if bootstrap_cuda and not has_nvidia_gpu():
+        log(
+            f"[comfy-env] Bootstrap torch is cu{bootstrap_cuda.replace('.', '')[:3]} "
+            f"but no NVIDIA GPU detected -- ignoring cuda tag, using CPU index"
+        )
+        bootstrap_cuda = None
+
+    cu_tag_bootstrap = (
+        f"cu{bootstrap_cuda.replace('.', '')}" if bootstrap_cuda else "cpu"
+    )
+    py_short = python_version.replace(".", "") if python_version else "?"
+    if torch_version:
+        log(
+            f"[comfy-env] Bootstrap interpreter has python {python_version} + "
+            f"torch {torch_version} ({cu_tag_bootstrap}). Looking for cuda-only "
+            f"wheels matching {cu_tag_bootstrap}/torch{torch_version.rsplit('.', 1)[0]}/cp{py_short}."
+        )
+    else:
+        # A Python with no torch is not a ComfyUI's: ComfyUI imports torch
+        # unconditionally, and a CPU-only ComfyUI still has a CPU torch. So
+        # this can only mean install.py was run with some other interpreter.
+        # An env built from it is keyed `py3XX-notorch` and stamped for a host
+        # that has no torch, which no real host ever is, so nothing can bind
+        # it -- a gigabyte of the wrong torch in a directory nothing will use.
+        # Refuse here, before any disk is touched, and say what to run.
+        raise RuntimeError(
+            f"[comfy-env] The interpreter running this install (python "
+            f"{python_version}, {sys.executable}) has no torch, so it is not a "
+            f"ComfyUI's. Envs are keyed on the ComfyUI interpreter's python, "
+            f"torch and CUDA, and one built without them can never be bound. "
+            f"Run install.py with the python that runs ComfyUI's main.py."
+        )
+
+    if sys.platform == "darwin":
+
+--- workspace lines 61-115 ---
+    + version. Linux/Windows without GPU: (cpu_index, None, None, py, torch).
+    """
+    from ..detection import (
+        get_recommended_cuda_version,
+        get_gpu_summary,
+        get_bootstrap_python_version,
+        get_bootstrap_torch_version,
+        get_bootstrap_torch_cuda,
+    )
+    cpu_index = "https://download.pytorch.org/whl/cpu"
+    python_version = get_bootstrap_python_version()
+    torch_version = get_bootstrap_torch_version()
+    bootstrap_cuda = get_bootstrap_torch_cuda()
+
+    # Portable ComfyUI ships torch+cu128 inside python_embeded, so bootstrap_cuda
+    # is "12.8" even on a hosted runner with no NVIDIA driver. Treat it as
+    # CPU-only when no GPU is actually present -- otherwise pixi installs cu*
+    # wheels into every env and `import torch` later dies with WinError 127
+    # (or its Linux equivalent) trying to load shm.dll / libtorch_cuda.so.
+    from ..detection.cuda import has_nvidia_gpu
+    if bootstrap_cuda and not has_nvidia_gpu():
+        log(
+            f"[comfy-env] Bootstrap torch is cu{bootstrap_cuda.replace('.', '')[:3]} "
+            f"but no NVIDIA GPU detected -- ignoring cuda tag, using CPU index"
+        )
+        bootstrap_cuda = None
+
+    cu_tag_bootstrap = (
+        f"cu{bootstrap_cuda.replace('.', '')}" if bootstrap_cuda else "cpu"
+    )
+    py_short = python_version.replace(".", "") if python_version else "?"
+    if torch_version:
+        log(
+            f"[comfy-env] Bootstrap interpreter has python {python_version} + "
+            f"torch {torch_version} ({cu_tag_bootstrap}). Looking for cuda-only "
+            f"wheels matching {cu_tag_bootstrap}/torch{torch_version.rsplit('.', 1)[0]}/cp{py_short}."
+        )
+    else:
+        # A Python with no torch is not a ComfyUI's: ComfyUI imports torch
+        # unconditionally, and a CPU-only ComfyUI still has a CPU torch. So
+        # this can only mean install.py was run with some other interpreter.
+        # An env built from it is keyed `py3XX-notorch` and stamped for a host
+        # that has no torch, which no real host ever is, so nothing can bind
+        # it -- a gigabyte of the wrong torch in a directory nothing will use.
+        # Refuse here, before any disk is touched, and say what to run.
+        raise RuntimeError(
+            f"[comfy-env] The interpreter running this install (python "
+            f"{python_version}, {sys.executable}) has no torch, so it is not a "
+            f"ComfyUI's. Envs are keyed on the ComfyUI interpreter's python, "
+            f"torch and CUDA, and one built without them can never be bound. "
+            f"Run install.py with the python that runs ComfyUI's main.py."
+        )
+
+    if sys.platform == "darwin":
+        # PyTorch's `/whl/cpu/` index is Linux+Windows-only — there are no
+
+--- workspace lines 63-117 ---
+    from ..detection import (
+        get_recommended_cuda_version,
+        get_gpu_summary,
+        get_bootstrap_python_version,
+        get_bootstrap_torch_version,
+        get_bootstrap_torch_cuda,
+    )
+    cpu_index = "https://download.pytorch.org/whl/cpu"
+    python_version = get_bootstrap_python_version()
+    torch_version = get_bootstrap_torch_version()
+    bootstrap_cuda = get_bootstrap_torch_cuda()
+
+    # Portable ComfyUI ships torch+cu128 inside python_embeded, so bootstrap_cuda
+    # is "12.8" even on a hosted runner with no NVIDIA driver. Treat it as
+    # CPU-only when no GPU is actually present -- otherwise pixi installs cu*
+    # wheels into every env and `import torch` later dies with WinError 127
+    # (or its Linux equivalent) trying to load shm.dll / libtorch_cuda.so.
+    from ..detection.cuda import has_nvidia_gpu
+    if bootstrap_cuda and not has_nvidia_gpu():
+        log(
+            f"[comfy-env] Bootstrap torch is cu{bootstrap_cuda.replace('.', '')[:3]} "
+            f"but no NVIDIA GPU detected -- ignoring cuda tag, using CPU index"
+        )
+        bootstrap_cuda = None
+
+    cu_tag_bootstrap = (
+        f"cu{bootstrap_cuda.replace('.', '')}" if bootstrap_cuda else "cpu"
+    )
+    py_short = python_version.replace(".", "") if python_version else "?"
+    if torch_version:
+        log(
+            f"[comfy-env] Bootstrap interpreter has python {python_version} + "
+            f"torch {torch_version} ({cu_tag_bootstrap}). Looking for cuda-only "
+            f"wheels matching {cu_tag_bootstrap}/torch{torch_version.rsplit('.', 1)[0]}/cp{py_short}."
+        )
+    else:
+        # A Python with no torch is not a ComfyUI's: ComfyUI imports torch
+        # unconditionally, and a CPU-only ComfyUI still has a CPU torch. So
+        # this can only mean install.py was run with some other interpreter.
+        # An env built from it is keyed `py3XX-notorch` and stamped for a host
+        # that has no torch, which no real host ever is, so nothing can bind
+        # it -- a gigabyte of the wrong torch in a directory nothing will use.
+        # Refuse here, before any disk is touched, and say what to run.
+        raise RuntimeError(
+            f"[comfy-env] The interpreter running this install (python "
+            f"{python_version}, {sys.executable}) has no torch, so it is not a "
+            f"ComfyUI's. Envs are keyed on the ComfyUI interpreter's python, "
+            f"torch and CUDA, and one built without them can never be bound. "
+            f"Run install.py with the python that runs ComfyUI's main.py."
+        )
+
+    if sys.platform == "darwin":
+        # PyTorch's `/whl/cpu/` index is Linux+Windows-only — there are no
+        # osx-arm64 / osx-64 wheels there. macOS torch lives on regular PyPI
+        # (the wheel is implicitly CPU-only since there's no CUDA on Apple
+
+--- workspace lines 66-120 ---
+        get_bootstrap_python_version,
+        get_bootstrap_torch_version,
+        get_bootstrap_torch_cuda,
+    )
+    cpu_index = "https://download.pytorch.org/whl/cpu"
+    python_version = get_bootstrap_python_version()
+    torch_version = get_bootstrap_torch_version()
+    bootstrap_cuda = get_bootstrap_torch_cuda()
+
+    # Portable ComfyUI ships torch+cu128 inside python_embeded, so bootstrap_cuda
+    # is "12.8" even on a hosted runner with no NVIDIA driver. Treat it as
+    # CPU-only when no GPU is actually present -- otherwise pixi installs cu*
+    # wheels into every env and `import torch` later dies with WinError 127
+    # (or its Linux equivalent) trying to load shm.dll / libtorch_cuda.so.
+    from ..detection.cuda import has_nvidia_gpu
+    if bootstrap_cuda and not has_nvidia_gpu():
+        log(
+            f"[comfy-env] Bootstrap torch is cu{bootstrap_cuda.replace('.', '')[:3]} "
+            f"but no NVIDIA GPU detected -- ignoring cuda tag, using CPU index"
+        )
+        bootstrap_cuda = None
+
+    cu_tag_bootstrap = (
+        f"cu{bootstrap_cuda.replace('.', '')}" if bootstrap_cuda else "cpu"
+    )
+    py_short = python_version.replace(".", "") if python_version else "?"
+    if torch_version:
+        log(
+            f"[comfy-env] Bootstrap interpreter has python {python_version} + "
+            f"torch {torch_version} ({cu_tag_bootstrap}). Looking for cuda-only "
+            f"wheels matching {cu_tag_bootstrap}/torch{torch_version.rsplit('.', 1)[0]}/cp{py_short}."
+        )
+    else:
+        # A Python with no torch is not a ComfyUI's: ComfyUI imports torch
+        # unconditionally, and a CPU-only ComfyUI still has a CPU torch. So
+        # this can only mean install.py was run with some other interpreter.
+        # An env built from it is keyed `py3XX-notorch` and stamped for a host
+        # that has no torch, which no real host ever is, so nothing can bind
+        # it -- a gigabyte of the wrong torch in a directory nothing will use.
+        # Refuse here, before any disk is touched, and say what to run.
+        raise RuntimeError(
+            f"[comfy-env] The interpreter running this install (python "
+            f"{python_version}, {sys.executable}) has no torch, so it is not a "
+            f"ComfyUI's. Envs are keyed on the ComfyUI interpreter's python, "
+            f"torch and CUDA, and one built without them can never be bound. "
+            f"Run install.py with the python that runs ComfyUI's main.py."
+        )
+
+    if sys.platform == "darwin":
+        # PyTorch's `/whl/cpu/` index is Linux+Windows-only — there are no
+        # osx-arm64 / osx-64 wheels there. macOS torch lives on regular PyPI
+        # (the wheel is implicitly CPU-only since there's no CUDA on Apple
+        # Silicon). Returning None for torch_index lets pixi resolve from the
+        # default PyPI index instead of erroring "no matching platform tag".
+        return None, None, None, python_version, torch_version
+
+--- workspace lines 69-123 ---
+    )
+    cpu_index = "https://download.pytorch.org/whl/cpu"
+    python_version = get_bootstrap_python_version()
+    torch_version = get_bootstrap_torch_version()
+    bootstrap_cuda = get_bootstrap_torch_cuda()
+
+    # Portable ComfyUI ships torch+cu128 inside python_embeded, so bootstrap_cuda
+    # is "12.8" even on a hosted runner with no NVIDIA driver. Treat it as
+    # CPU-only when no GPU is actually present -- otherwise pixi installs cu*
+    # wheels into every env and `import torch` later dies with WinError 127
+    # (or its Linux equivalent) trying to load shm.dll / libtorch_cuda.so.
+    from ..detection.cuda import has_nvidia_gpu
+    if bootstrap_cuda and not has_nvidia_gpu():
+        log(
+            f"[comfy-env] Bootstrap torch is cu{bootstrap_cuda.replace('.', '')[:3]} "
+            f"but no NVIDIA GPU detected -- ignoring cuda tag, using CPU index"
+        )
+        bootstrap_cuda = None
+
+    cu_tag_bootstrap = (
+        f"cu{bootstrap_cuda.replace('.', '')}" if bootstrap_cuda else "cpu"
+    )
+    py_short = python_version.replace(".", "") if python_version else "?"
+    if torch_version:
+        log(
+            f"[comfy-env] Bootstrap interpreter has python {python_version} + "
+            f"torch {torch_version} ({cu_tag_bootstrap}). Looking for cuda-only "
+            f"wheels matching {cu_tag_bootstrap}/torch{torch_version.rsplit('.', 1)[0]}/cp{py_short}."
+        )
+    else:
+        # A Python with no torch is not a ComfyUI's: ComfyUI imports torch
+        # unconditionally, and a CPU-only ComfyUI still has a CPU torch. So
+        # this can only mean install.py was run with some other interpreter.
+        # An env built from it is keyed `py3XX-notorch` and stamped for a host
+        # that has no torch, which no real host ever is, so nothing can bind
+        # it -- a gigabyte of the wrong torch in a directory nothing will use.
+        # Refuse here, before any disk is touched, and say what to run.
+        raise RuntimeError(
+            f"[comfy-env] The interpreter running this install (python "
+            f"{python_version}, {sys.executable}) has no torch, so it is not a "
+            f"ComfyUI's. Envs are keyed on the ComfyUI interpreter's python, "
+            f"torch and CUDA, and one built without them can never be bound. "
+            f"Run install.py with the python that runs ComfyUI's main.py."
+        )
+
+    if sys.platform == "darwin":
+        # PyTorch's `/whl/cpu/` index is Linux+Windows-only — there are no
+        # osx-arm64 / osx-64 wheels there. macOS torch lives on regular PyPI
+        # (the wheel is implicitly CPU-only since there's no CUDA on Apple
+        # Silicon). Returning None for torch_index lets pixi resolve from the
+        # default PyPI index instead of erroring "no matching platform tag".
+        return None, None, None, python_version, torch_version
+
+    log(f"[comfy-env] GPU: {get_gpu_summary()}")
+    cuda_version = bootstrap_cuda or get_recommended_cuda_version()
+
+--- workspace lines 103-157 ---
+        # that has no torch, which no real host ever is, so nothing can bind
+        # it -- a gigabyte of the wrong torch in a directory nothing will use.
+        # Refuse here, before any disk is touched, and say what to run.
+        raise RuntimeError(
+            f"[comfy-env] The interpreter running this install (python "
+            f"{python_version}, {sys.executable}) has no torch, so it is not a "
+            f"ComfyUI's. Envs are keyed on the ComfyUI interpreter's python, "
+            f"torch and CUDA, and one built without them can never be bound. "
+            f"Run install.py with the python that runs ComfyUI's main.py."
+        )
+
+    if sys.platform == "darwin":
+        # PyTorch's `/whl/cpu/` index is Linux+Windows-only — there are no
+        # osx-arm64 / osx-64 wheels there. macOS torch lives on regular PyPI
+        # (the wheel is implicitly CPU-only since there's no CUDA on Apple
+        # Silicon). Returning None for torch_index lets pixi resolve from the
+        # default PyPI index instead of erroring "no matching platform tag".
+        return None, None, None, python_version, torch_version
+
+    log(f"[comfy-env] GPU: {get_gpu_summary()}")
+    cuda_version = bootstrap_cuda or get_recommended_cuda_version()
+    if not cuda_version:
+        log("[comfy-env] No CUDA detected -- pinning comfyui torch to CPU index")
+        return cpu_index, None, None, python_version, torch_version
+
+    cu_tag = "cu" + cuda_version.replace(".", "")[:3]
+    torch_index = f"https://download.pytorch.org/whl/{cu_tag}"
+    cuda_major = cuda_version.split(".")[0]
+    src = "bootstrap torch" if bootstrap_cuda else "GPU driver"
+    log(
+        f"[comfy-env] Comfyui feature -> torch {torch_version or '*'} from "
+        f"{torch_index} (CUDA {cuda_version} via {src})"
+    )
+    return torch_index, cuda_version, cuda_major, python_version, torch_version
+
+
+def _bindable_config_paths(plugin_dir: Path) -> List[Path]:
+    """The ONLY locations the runtime binder supports: `nodes/comfy-env.toml`
+    and `nodes/<subdir>/comfy-env.toml` (isolation/wrap.py pattern 1 and 2).
+
+    Discovery enumerates exactly these shapes -- deliberately NOT a recursive
+    glob. A config anywhere else (pack root, deeper nesting, vendored trees)
+    could be materialized but never bound, silently wasting gigabytes; by
+    matching discovery to binding, that whole class cannot occur.
+    """
+    nodes_dir = plugin_dir / "nodes"
+    if not nodes_dir.is_dir():
+        return []
+    out = []
+    root_cf = nodes_dir / CONFIG_FILE_NAME
+    if root_cf.is_file():
+        out.append(root_cf)
+    for child in sorted(nodes_dir.iterdir()):
+        if child.is_dir() and not child.name.startswith((".", "_")):
+            cf = child / CONFIG_FILE_NAME
+
+--- workspace lines 106-160 ---
+        raise RuntimeError(
+            f"[comfy-env] The interpreter running this install (python "
+            f"{python_version}, {sys.executable}) has no torch, so it is not a "
+            f"ComfyUI's. Envs are keyed on the ComfyUI interpreter's python, "
+            f"torch and CUDA, and one built without them can never be bound. "
+            f"Run install.py with the python that runs ComfyUI's main.py."
+        )
+
+    if sys.platform == "darwin":
+        # PyTorch's `/whl/cpu/` index is Linux+Windows-only — there are no
+        # osx-arm64 / osx-64 wheels there. macOS torch lives on regular PyPI
+        # (the wheel is implicitly CPU-only since there's no CUDA on Apple
+        # Silicon). Returning None for torch_index lets pixi resolve from the
+        # default PyPI index instead of erroring "no matching platform tag".
+        return None, None, None, python_version, torch_version
+
+    log(f"[comfy-env] GPU: {get_gpu_summary()}")
+    cuda_version = bootstrap_cuda or get_recommended_cuda_version()
+    if not cuda_version:
+        log("[comfy-env] No CUDA detected -- pinning comfyui torch to CPU index")
+        return cpu_index, None, None, python_version, torch_version
+
+    cu_tag = "cu" + cuda_version.replace(".", "")[:3]
+    torch_index = f"https://download.pytorch.org/whl/{cu_tag}"
+    cuda_major = cuda_version.split(".")[0]
+    src = "bootstrap torch" if bootstrap_cuda else "GPU driver"
+    log(
+        f"[comfy-env] Comfyui feature -> torch {torch_version or '*'} from "
+        f"{torch_index} (CUDA {cuda_version} via {src})"
+    )
+    return torch_index, cuda_version, cuda_major, python_version, torch_version
+
+
+def _bindable_config_paths(plugin_dir: Path) -> List[Path]:
+    """The ONLY locations the runtime binder supports: `nodes/comfy-env.toml`
+    and `nodes/<subdir>/comfy-env.toml` (isolation/wrap.py pattern 1 and 2).
+
+    Discovery enumerates exactly these shapes -- deliberately NOT a recursive
+    glob. A config anywhere else (pack root, deeper nesting, vendored trees)
+    could be materialized but never bound, silently wasting gigabytes; by
+    matching discovery to binding, that whole class cannot occur.
+    """
+    nodes_dir = plugin_dir / "nodes"
+    if not nodes_dir.is_dir():
+        return []
+    out = []
+    root_cf = nodes_dir / CONFIG_FILE_NAME
+    if root_cf.is_file():
+        out.append(root_cf)
+    for child in sorted(nodes_dir.iterdir()):
+        if child.is_dir() and not child.name.startswith((".", "_")):
+            cf = child / CONFIG_FILE_NAME
+            if cf.is_file():
+                out.append(cf)
+    return out
+
+--- workspace lines 111-165 ---
+            f"Run install.py with the python that runs ComfyUI's main.py."
+        )
+
+    if sys.platform == "darwin":
+        # PyTorch's `/whl/cpu/` index is Linux+Windows-only — there are no
+        # osx-arm64 / osx-64 wheels there. macOS torch lives on regular PyPI
+        # (the wheel is implicitly CPU-only since there's no CUDA on Apple
+        # Silicon). Returning None for torch_index lets pixi resolve from the
+        # default PyPI index instead of erroring "no matching platform tag".
+        return None, None, None, python_version, torch_version
+
+    log(f"[comfy-env] GPU: {get_gpu_summary()}")
+    cuda_version = bootstrap_cuda or get_recommended_cuda_version()
+    if not cuda_version:
+        log("[comfy-env] No CUDA detected -- pinning comfyui torch to CPU index")
+        return cpu_index, None, None, python_version, torch_version
+
+    cu_tag = "cu" + cuda_version.replace(".", "")[:3]
+    torch_index = f"https://download.pytorch.org/whl/{cu_tag}"
+    cuda_major = cuda_version.split(".")[0]
+    src = "bootstrap torch" if bootstrap_cuda else "GPU driver"
+    log(
+        f"[comfy-env] Comfyui feature -> torch {torch_version or '*'} from "
+        f"{torch_index} (CUDA {cuda_version} via {src})"
+    )
+    return torch_index, cuda_version, cuda_major, python_version, torch_version
+
+
+def _bindable_config_paths(plugin_dir: Path) -> List[Path]:
+    """The ONLY locations the runtime binder supports: `nodes/comfy-env.toml`
+    and `nodes/<subdir>/comfy-env.toml` (isolation/wrap.py pattern 1 and 2).
+
+    Discovery enumerates exactly these shapes -- deliberately NOT a recursive
+    glob. A config anywhere else (pack root, deeper nesting, vendored trees)
+    could be materialized but never bound, silently wasting gigabytes; by
+    matching discovery to binding, that whole class cannot occur.
+    """
+    nodes_dir = plugin_dir / "nodes"
+    if not nodes_dir.is_dir():
+        return []
+    out = []
+    root_cf = nodes_dir / CONFIG_FILE_NAME
+    if root_cf.is_file():
+        out.append(root_cf)
+    for child in sorted(nodes_dir.iterdir()):
+        if child.is_dir() and not child.name.startswith((".", "_")):
+            cf = child / CONFIG_FILE_NAME
+            if cf.is_file():
+                out.append(cf)
+    return out
+
+
+def _discover_node_configs(
+    comfyui_dir: Path,
+    log: Callable[[str], None] = print,
+
+--- workspace lines 286-340 ---
+    ``install_workspace`` is deliberately the only builder: keeping two
+    implementations of this rule in agreement proved unenforceable.
+
+    major.minor, not the exact patch: must match the granularity of the ABI
+    tag that names the env directory (environment/cache.py _abi_tag). A
+    finer pin than the key means two installs collide on one directory and
+    re-solve each other; a coarser pin would let an env silently satisfy a
+    stack it was not built for.
+    """
+    if not bootstrap_torch:
+        return None
+    return "==" + ".".join(bootstrap_torch.split(".")[:2]) + ".*"
+
+
+def _fast_key(
+    cf: Path,
+    discovered: List[Tuple[str, "Path", "Path", "ComfyEnvConfig"]],
+    comfyui_dir: Optional[Path] = None,
+) -> str:
+    """Local-only change detector (level 1). See block comment above."""
+    from ..detection.cuda import has_nvidia_gpu
+    from ..environment.cache import _abi_tag
+    from ..packages.toml_generator import _HOST_DERIVED_PKGS, read_host_pin
+
+    h = hashlib.sha256()
+    # Manifest-format generation. Bump when the SHAPE of what install writes
+    # changes (not its inputs): the level-1 gate otherwise short-circuits on
+    # unchanged local inputs and an on-disk layout from an older comfy-env
+    # persists invisibly. fmt2 = cuda wheels inlined into pixi.toml/pixi.lock.
+    h.update(b"fmt:2\n")
+    h.update(b"abi:")
+    h.update(_abi_tag().encode())
+    h.update(b"\ngpu:")
+    h.update(b"1" if has_nvidia_gpu() else b"0")
+    h.update(b"\n")
+
+    combo_inputs = sorted(
+        {pkg for _n, _p, _c, cfg in discovered for pkg in cfg.cuda_packages}
+    ) + sorted(
+        {cfg.python or "host" for _n, _p, _c, cfg in discovered}
+    )
+    # The host's pins for packages comfy-env replicates rather than authors.
+    # Without these the gate reads "nothing changed locally" and skips, so a
+    # ComfyUI update that moves the comfy-aimdo pin never reaches an existing
+    # env: it keeps the old wheel for the life of the install and the only
+    # sign is a version-skew NOTE at runtime. The rule is "replicate the
+    # host's pin"; this is what makes it true after the first install.
+    h.update(b"host-pins:")
+    for pkg in _HOST_DERIVED_PKGS:
+        h.update(pkg.encode())
+        h.update(b"=")
+        h.update((read_host_pin(comfyui_dir, pkg) or "-").encode())
+        h.update(b";")
+    h.update(b"\n")
+
+
+--- workspace lines 299-353 ---
+
+def _fast_key(
+    cf: Path,
+    discovered: List[Tuple[str, "Path", "Path", "ComfyEnvConfig"]],
+    comfyui_dir: Optional[Path] = None,
+) -> str:
+    """Local-only change detector (level 1). See block comment above."""
+    from ..detection.cuda import has_nvidia_gpu
+    from ..environment.cache import _abi_tag
+    from ..packages.toml_generator import _HOST_DERIVED_PKGS, read_host_pin
+
+    h = hashlib.sha256()
+    # Manifest-format generation. Bump when the SHAPE of what install writes
+    # changes (not its inputs): the level-1 gate otherwise short-circuits on
+    # unchanged local inputs and an on-disk layout from an older comfy-env
+    # persists invisibly. fmt2 = cuda wheels inlined into pixi.toml/pixi.lock.
+    h.update(b"fmt:2\n")
+    h.update(b"abi:")
+    h.update(_abi_tag().encode())
+    h.update(b"\ngpu:")
+    h.update(b"1" if has_nvidia_gpu() else b"0")
+    h.update(b"\n")
+
+    combo_inputs = sorted(
+        {pkg for _n, _p, _c, cfg in discovered for pkg in cfg.cuda_packages}
+    ) + sorted(
+        {cfg.python or "host" for _n, _p, _c, cfg in discovered}
+    )
+    # The host's pins for packages comfy-env replicates rather than authors.
+    # Without these the gate reads "nothing changed locally" and skips, so a
+    # ComfyUI update that moves the comfy-aimdo pin never reaches an existing
+    # env: it keeps the old wheel for the life of the install and the only
+    # sign is a version-skew NOTE at runtime. The rule is "replicate the
+    # host's pin"; this is what makes it true after the first install.
+    h.update(b"host-pins:")
+    for pkg in _HOST_DERIVED_PKGS:
+        h.update(pkg.encode())
+        h.update(b"=")
+        h.update((read_host_pin(comfyui_dir, pkg) or "-").encode())
+        h.update(b";")
+    h.update(b"\n")
+
+    h.update(b"combo-inputs:")
+    h.update(",".join(combo_inputs).encode())
+    h.update(b"\ntoml:")
+    try:
+        h.update(cf.read_bytes())
+    except OSError:
+        pass
+    h.update(b"\n")
+    return h.hexdigest()
+
+
+def _env_identity(manifest: Dict[str, Any], wheel_urls: List[str]) -> str:
+    """Derivation-output identity (level 2). Canonical JSON so dict insertion
+
+--- workspace lines 481-535 ---
+    """Group cuda packages by their env's Python version.
+
+    Returns ``{python_version: [packages]}`` where each package list is
+    deduplicated but preserves insertion order.
+    """
+    by_py: Dict[str, List[str]] = {}
+    for _en, _pl, _cf, cfg in discovered:
+        py = cfg.python or bootstrap_python
+        for p in cfg.cuda_packages:
+            if p in _PYTORCH_PACKAGES:
+                continue
+            pkgs = by_py.setdefault(py, [])
+            if p not in pkgs:
+                pkgs.append(p)
+    return by_py
+
+
+def _resolve_wheel_combo(
+    discovered: List[Tuple[str, Path, Path, ComfyEnvConfig]],
+    bootstrap_python: str,
+    bootstrap_cuda: Optional[str],
+    bootstrap_torch: Optional[str],
+    log: Callable[[str], None],
+) -> Optional[Tuple[str, str, str, str, str]]:
+    """Pick the (python, cuda, torch_match, torch_pin, source) combo for the workspace.
+
+    The returned ``python`` field is the bootstrap Python; per-env Python versions
+    are handled at URL-resolution time in ``resolve_env_cuda_wheel_urls``.
+
+    The bootstrap combo wins if every required wheel is published for it across
+    all env Pythons; else the per-architecture fallback (FALLBACK_COMBO /
+    FALLBACK_COMBO_AARCH64 in cuda_wheels record WHY the two architectures need
+    different ones); else raise. The cuda and torch axes move together, so the
+    torch pin follows the chosen combo rather than being fixed.
+
+    Returns None when there's nothing to resolve (no cuda-only packages required,
+    or running on macOS/CPU). In that case the caller skips wheel-combo logic and
+    leaves torch as `*` in the comfyui feature.
+    """
+    if not bootstrap_cuda or sys.platform == "darwin":
+        return None
+
+    from ..detection.cuda import has_nvidia_gpu
+    if not has_nvidia_gpu():
+        log("[comfy-env] cuda-wheels: skipping (no NVIDIA GPU detected)")
+        return None
+
+    packages = _aggregate_cuda_packages(discovered)
+    if not packages:
+        return None
+
+    pkgs_by_py = _cuda_packages_by_python(discovered, bootstrap_python)
+
+    from ..packages.cuda_wheels import (
+        check_all_wheels_available,
+
+--- workspace lines 500-554 ---
+    bootstrap_python: str,
+    bootstrap_cuda: Optional[str],
+    bootstrap_torch: Optional[str],
+    log: Callable[[str], None],
+) -> Optional[Tuple[str, str, str, str, str]]:
+    """Pick the (python, cuda, torch_match, torch_pin, source) combo for the workspace.
+
+    The returned ``python`` field is the bootstrap Python; per-env Python versions
+    are handled at URL-resolution time in ``resolve_env_cuda_wheel_urls``.
+
+    The bootstrap combo wins if every required wheel is published for it across
+    all env Pythons; else the per-architecture fallback (FALLBACK_COMBO /
+    FALLBACK_COMBO_AARCH64 in cuda_wheels record WHY the two architectures need
+    different ones); else raise. The cuda and torch axes move together, so the
+    torch pin follows the chosen combo rather than being fixed.
+
+    Returns None when there's nothing to resolve (no cuda-only packages required,
+    or running on macOS/CPU). In that case the caller skips wheel-combo logic and
+    leaves torch as `*` in the comfyui feature.
+    """
+    if not bootstrap_cuda or sys.platform == "darwin":
+        return None
+
+    from ..detection.cuda import has_nvidia_gpu
+    if not has_nvidia_gpu():
+        log("[comfy-env] cuda-wheels: skipping (no NVIDIA GPU detected)")
+        return None
+
+    packages = _aggregate_cuda_packages(discovered)
+    if not packages:
+        return None
+
+    pkgs_by_py = _cuda_packages_by_python(discovered, bootstrap_python)
+
+    from ..packages.cuda_wheels import (
+        check_all_wheels_available,
+        resolve_fallback_combo,
+        cuda_wheels_index,
+    )
+
+    log(
+        f"[comfy-env] cuda-wheels: {len(packages)} package(s) need a "
+        f"matched (cuda, torch, python) combo: {packages}"
+    )
+    if len(pkgs_by_py) > 1:
+        log(
+            f"[comfy-env] cuda-wheels: checking across Python versions: "
+            f"{', '.join(f'cp{py}' for py in pkgs_by_py)}"
+        )
+
+    def _check_all_python_versions(
+        torch_ver: str, cuda_ver: str, label: str,
+    ) -> Optional[str]:
+        """Check wheels for every Python version. Returns first missing pkg or None."""
+        for py, py_pkgs in pkgs_by_py.items():
+
+--- workspace lines 503-557 ---
+    log: Callable[[str], None],
+) -> Optional[Tuple[str, str, str, str, str]]:
+    """Pick the (python, cuda, torch_match, torch_pin, source) combo for the workspace.
+
+    The returned ``python`` field is the bootstrap Python; per-env Python versions
+    are handled at URL-resolution time in ``resolve_env_cuda_wheel_urls``.
+
+    The bootstrap combo wins if every required wheel is published for it across
+    all env Pythons; else the per-architecture fallback (FALLBACK_COMBO /
+    FALLBACK_COMBO_AARCH64 in cuda_wheels record WHY the two architectures need
+    different ones); else raise. The cuda and torch axes move together, so the
+    torch pin follows the chosen combo rather than being fixed.
+
+    Returns None when there's nothing to resolve (no cuda-only packages required,
+    or running on macOS/CPU). In that case the caller skips wheel-combo logic and
+    leaves torch as `*` in the comfyui feature.
+    """
+    if not bootstrap_cuda or sys.platform == "darwin":
+        return None
+
+    from ..detection.cuda import has_nvidia_gpu
+    if not has_nvidia_gpu():
+        log("[comfy-env] cuda-wheels: skipping (no NVIDIA GPU detected)")
+        return None
+
+    packages = _aggregate_cuda_packages(discovered)
+    if not packages:
+        return None
+
+    pkgs_by_py = _cuda_packages_by_python(discovered, bootstrap_python)
+
+    from ..packages.cuda_wheels import (
+        check_all_wheels_available,
+        resolve_fallback_combo,
+        cuda_wheels_index,
+    )
+
+    log(
+        f"[comfy-env] cuda-wheels: {len(packages)} package(s) need a "
+        f"matched (cuda, torch, python) combo: {packages}"
+    )
+    if len(pkgs_by_py) > 1:
+        log(
+            f"[comfy-env] cuda-wheels: checking across Python versions: "
+            f"{', '.join(f'cp{py}' for py in pkgs_by_py)}"
+        )
+
+    def _check_all_python_versions(
+        torch_ver: str, cuda_ver: str, label: str,
+    ) -> Optional[str]:
+        """Check wheels for every Python version. Returns first missing pkg or None."""
+        for py, py_pkgs in pkgs_by_py.items():
+            cp = py.replace(".", "")
+            log(
+                f"[comfy-env] cuda-wheels {label}: probing "
+
+--- workspace lines 504-558 ---
+) -> Optional[Tuple[str, str, str, str, str]]:
+    """Pick the (python, cuda, torch_match, torch_pin, source) combo for the workspace.
+
+    The returned ``python`` field is the bootstrap Python; per-env Python versions
+    are handled at URL-resolution time in ``resolve_env_cuda_wheel_urls``.
+
+    The bootstrap combo wins if every required wheel is published for it across
+    all env Pythons; else the per-architecture fallback (FALLBACK_COMBO /
+    FALLBACK_COMBO_AARCH64 in cuda_wheels record WHY the two architectures need
+    different ones); else raise. The cuda and torch axes move together, so the
+    torch pin follows the chosen combo rather than being fixed.
+
+    Returns None when there's nothing to resolve (no cuda-only packages required,
+    or running on macOS/CPU). In that case the caller skips wheel-combo logic and
+    leaves torch as `*` in the comfyui feature.
+    """
+    if not bootstrap_cuda or sys.platform == "darwin":
+        return None
+
+    from ..detection.cuda import has_nvidia_gpu
+    if not has_nvidia_gpu():
+        log("[comfy-env] cuda-wheels: skipping (no NVIDIA GPU detected)")
+        return None
+
+    packages = _aggregate_cuda_packages(discovered)
+    if not packages:
+        return None
+
+    pkgs_by_py = _cuda_packages_by_python(discovered, bootstrap_python)
+
+    from ..packages.cuda_wheels import (
+        check_all_wheels_available,
+        resolve_fallback_combo,
+        cuda_wheels_index,
+    )
+
+    log(
+        f"[comfy-env] cuda-wheels: {len(packages)} package(s) need a "
+        f"matched (cuda, torch, python) combo: {packages}"
+    )
+    if len(pkgs_by_py) > 1:
+        log(
+            f"[comfy-env] cuda-wheels: checking across Python versions: "
+            f"{', '.join(f'cp{py}' for py in pkgs_by_py)}"
+        )
+
+    def _check_all_python_versions(
+        torch_ver: str, cuda_ver: str, label: str,
+    ) -> Optional[str]:
+        """Check wheels for every Python version. Returns first missing pkg or None."""
+        for py, py_pkgs in pkgs_by_py.items():
+            cp = py.replace(".", "")
+            log(
+                f"[comfy-env] cuda-wheels {label}: probing "
+                f"cu{cuda_ver}/torch{torch_ver}/cp{cp}"
+
+--- workspace lines 551-605 ---
+        torch_ver: str, cuda_ver: str, label: str,
+    ) -> Optional[str]:
+        """Check wheels for every Python version. Returns first missing pkg or None."""
+        for py, py_pkgs in pkgs_by_py.items():
+            cp = py.replace(".", "")
+            log(
+                f"[comfy-env] cuda-wheels {label}: probing "
+                f"cu{cuda_ver}/torch{torch_ver}/cp{cp}"
+            )
+            miss = check_all_wheels_available(
+                py_pkgs, torch_ver, cuda_ver, py, log=log,
+            )
+            if miss is not None:
+                return miss
+        return None
+
+    # Tier 1: bootstrap combo
+    if bootstrap_torch:
+        torch_short = ".".join(bootstrap_torch.split(".")[:2])
+        miss = _check_all_python_versions(
+            torch_short, bootstrap_cuda, "tier 1 (bootstrap)",
+        )
+        if miss is None:
+            log(
+                f"[comfy-env] cuda-wheels combo: cu{bootstrap_cuda}/torch{torch_short} "
+                f"(bootstrap matches; per-node envs will pin to this)"
+            )
+            return (
+                bootstrap_python,
+                bootstrap_cuda,
+                torch_short,
+                # major.minor, matching tier 2 below and the ABI tag in the env
+                # directory name. Pinning the exact patch here made the pin
+                # FINER than the key: installs on 2.10.0 and 2.10.2 share
+                # `...-torch2-10-...` and rewrote each other's manifest on every
+                # alternation. The cuda wheels are stamped `torch2.10` anyway.
+                f"=={torch_short}.*",
+                "bootstrap",
+            )
+        log(
+            f"[comfy-env] cuda-wheels tier 1 incomplete: `{miss}` not built for "
+            f"cu{bootstrap_cuda}+torch{torch_short}; falling back"
+        )
+    else:
+        log(
+            "[comfy-env] cuda-wheels: bootstrap torch unknown; skipping tier 1, trying fallback"
+        )
+
+    # Tier 2: known-good fallback for this CPU arch (cu128/torch2.8 on x86_64,
+    # cu130/torch2.10 on linux aarch64 -- see FALLBACK_COMBO_AARCH64 for why).
+    fb_cuda, fb_torch = resolve_fallback_combo()
+    miss = _check_all_python_versions(
+        fb_torch, fb_cuda, "tier 2 (fallback)",
+    )
+    if miss is None:
+
+--- workspace lines 555-609 ---
+            cp = py.replace(".", "")
+            log(
+                f"[comfy-env] cuda-wheels {label}: probing "
+                f"cu{cuda_ver}/torch{torch_ver}/cp{cp}"
+            )
+            miss = check_all_wheels_available(
+                py_pkgs, torch_ver, cuda_ver, py, log=log,
+            )
+            if miss is not None:
+                return miss
+        return None
+
+    # Tier 1: bootstrap combo
+    if bootstrap_torch:
+        torch_short = ".".join(bootstrap_torch.split(".")[:2])
+        miss = _check_all_python_versions(
+            torch_short, bootstrap_cuda, "tier 1 (bootstrap)",
+        )
+        if miss is None:
+            log(
+                f"[comfy-env] cuda-wheels combo: cu{bootstrap_cuda}/torch{torch_short} "
+                f"(bootstrap matches; per-node envs will pin to this)"
+            )
+            return (
+                bootstrap_python,
+                bootstrap_cuda,
+                torch_short,
+                # major.minor, matching tier 2 below and the ABI tag in the env
+                # directory name. Pinning the exact patch here made the pin
+                # FINER than the key: installs on 2.10.0 and 2.10.2 share
+                # `...-torch2-10-...` and rewrote each other's manifest on every
+                # alternation. The cuda wheels are stamped `torch2.10` anyway.
+                f"=={torch_short}.*",
+                "bootstrap",
+            )
+        log(
+            f"[comfy-env] cuda-wheels tier 1 incomplete: `{miss}` not built for "
+            f"cu{bootstrap_cuda}+torch{torch_short}; falling back"
+        )
+    else:
+        log(
+            "[comfy-env] cuda-wheels: bootstrap torch unknown; skipping tier 1, trying fallback"
+        )
+
+    # Tier 2: known-good fallback for this CPU arch (cu128/torch2.8 on x86_64,
+    # cu130/torch2.10 on linux aarch64 -- see FALLBACK_COMBO_AARCH64 for why).
+    fb_cuda, fb_torch = resolve_fallback_combo()
+    miss = _check_all_python_versions(
+        fb_torch, fb_cuda, "tier 2 (fallback)",
+    )
+    if miss is None:
+        log(
+            f"[comfy-env] cuda-wheels combo: cu{fb_cuda}/torch{fb_torch} "
+            f"(fallback; per-node cuda envs will override torch to this combo "
+            f"while comfyui keeps bootstrap torch)"
+
+--- workspace lines 560-614 ---
+            miss = check_all_wheels_available(
+                py_pkgs, torch_ver, cuda_ver, py, log=log,
+            )
+            if miss is not None:
+                return miss
+        return None
+
+    # Tier 1: bootstrap combo
+    if bootstrap_torch:
+        torch_short = ".".join(bootstrap_torch.split(".")[:2])
+        miss = _check_all_python_versions(
+            torch_short, bootstrap_cuda, "tier 1 (bootstrap)",
+        )
+        if miss is None:
+            log(
+                f"[comfy-env] cuda-wheels combo: cu{bootstrap_cuda}/torch{torch_short} "
+                f"(bootstrap matches; per-node envs will pin to this)"
+            )
+            return (
+                bootstrap_python,
+                bootstrap_cuda,
+                torch_short,
+                # major.minor, matching tier 2 below and the ABI tag in the env
+                # directory name. Pinning the exact patch here made the pin
+                # FINER than the key: installs on 2.10.0 and 2.10.2 share
+                # `...-torch2-10-...` and rewrote each other's manifest on every
+                # alternation. The cuda wheels are stamped `torch2.10` anyway.
+                f"=={torch_short}.*",
+                "bootstrap",
+            )
+        log(
+            f"[comfy-env] cuda-wheels tier 1 incomplete: `{miss}` not built for "
+            f"cu{bootstrap_cuda}+torch{torch_short}; falling back"
+        )
+    else:
+        log(
+            "[comfy-env] cuda-wheels: bootstrap torch unknown; skipping tier 1, trying fallback"
+        )
+
+    # Tier 2: known-good fallback for this CPU arch (cu128/torch2.8 on x86_64,
+    # cu130/torch2.10 on linux aarch64 -- see FALLBACK_COMBO_AARCH64 for why).
+    fb_cuda, fb_torch = resolve_fallback_combo()
+    miss = _check_all_python_versions(
+        fb_torch, fb_cuda, "tier 2 (fallback)",
+    )
+    if miss is None:
+        log(
+            f"[comfy-env] cuda-wheels combo: cu{fb_cuda}/torch{fb_torch} "
+            f"(fallback; per-node cuda envs will override torch to this combo "
+            f"while comfyui keeps bootstrap torch)"
+        )
+        return (
+            bootstrap_python,
+            fb_cuda,
+            fb_torch,
+
+--- workspace lines 572-626 ---
+        )
+        if miss is None:
+            log(
+                f"[comfy-env] cuda-wheels combo: cu{bootstrap_cuda}/torch{torch_short} "
+                f"(bootstrap matches; per-node envs will pin to this)"
+            )
+            return (
+                bootstrap_python,
+                bootstrap_cuda,
+                torch_short,
+                # major.minor, matching tier 2 below and the ABI tag in the env
+                # directory name. Pinning the exact patch here made the pin
+                # FINER than the key: installs on 2.10.0 and 2.10.2 share
+                # `...-torch2-10-...` and rewrote each other's manifest on every
+                # alternation. The cuda wheels are stamped `torch2.10` anyway.
+                f"=={torch_short}.*",
+                "bootstrap",
+            )
+        log(
+            f"[comfy-env] cuda-wheels tier 1 incomplete: `{miss}` not built for "
+            f"cu{bootstrap_cuda}+torch{torch_short}; falling back"
+        )
+    else:
+        log(
+            "[comfy-env] cuda-wheels: bootstrap torch unknown; skipping tier 1, trying fallback"
+        )
+
+    # Tier 2: known-good fallback for this CPU arch (cu128/torch2.8 on x86_64,
+    # cu130/torch2.10 on linux aarch64 -- see FALLBACK_COMBO_AARCH64 for why).
+    fb_cuda, fb_torch = resolve_fallback_combo()
+    miss = _check_all_python_versions(
+        fb_torch, fb_cuda, "tier 2 (fallback)",
+    )
+    if miss is None:
+        log(
+            f"[comfy-env] cuda-wheels combo: cu{fb_cuda}/torch{fb_torch} "
+            f"(fallback; per-node cuda envs will override torch to this combo "
+            f"while comfyui keeps bootstrap torch)"
+        )
+        return (
+            bootstrap_python,
+            fb_cuda,
+            fb_torch,
+            f"=={fb_torch}.*",
+            "fallback",
+        )
+
+    py_summary = ", ".join(f"cp{py}" for py in pkgs_by_py)
+    raise RuntimeError(
+        f"No cuda-wheels combo covers all required packages.\n"
+        f"  packages: {packages}\n"
+        f"  python versions: {py_summary}\n"
+        f"  tier 1 (bootstrap): cu{bootstrap_cuda}/torch{bootstrap_torch}"
+        f" -- missing or untried\n"
+        f"  tier 2 (fallback):  cu{fb_cuda}/torch{fb_torch}.*"
+
+--- workspace lines 604-658 ---
+    )
+    if miss is None:
+        log(
+            f"[comfy-env] cuda-wheels combo: cu{fb_cuda}/torch{fb_torch} "
+            f"(fallback; per-node cuda envs will override torch to this combo "
+            f"while comfyui keeps bootstrap torch)"
+        )
+        return (
+            bootstrap_python,
+            fb_cuda,
+            fb_torch,
+            f"=={fb_torch}.*",
+            "fallback",
+        )
+
+    py_summary = ", ".join(f"cp{py}" for py in pkgs_by_py)
+    raise RuntimeError(
+        f"No cuda-wheels combo covers all required packages.\n"
+        f"  packages: {packages}\n"
+        f"  python versions: {py_summary}\n"
+        f"  tier 1 (bootstrap): cu{bootstrap_cuda}/torch{bootstrap_torch}"
+        f" -- missing or untried\n"
+        f"  tier 2 (fallback):  cu{fb_cuda}/torch{fb_torch}.*"
+        f" -- {miss} missing\n"
+        f"Check {cuda_wheels_index()}{miss}/ and update the cuda-wheels build matrix."
+    )
+
+
+# Top-level workspace install
+
+def install_workspace(
+    comfyui_dir: Path,
+    log: Callable[[str], None] = print,
+    dry_run: bool = False,
+) -> Optional[Path]:
+    """Generate one ``pixi.toml`` per env under ``<workspace>/envs/<name>/`` and
+    run ``pixi install --manifest-path <env>/pixi.toml`` for each.
+
+    Per-env layout (v0.4+): each env's manifest is fully isolated. A parse
+    error in one env's pixi.toml cannot poison another env's scan or install.
+
+    No backward compatibility with the v0.3.x single-file workspace layout.
+    Users upgrading should ``rm -rf <workspace>/.pixi/`` and
+    ``<workspace>/pixi.toml`` before the first install; this function
+    re-materializes everything in the new layout.
+
+    Returns the workspace directory on success, None if nothing to install.
+    """
+    from ..pixi import ensure_pixi, PIXI
+    ensure_pixi()
+    from ..environment.cache import (
+        CE_WORKSPACE_DIR, get_workspace_dir, get_env_manifest_dir,
+    )
+    from ..packages.toml_generator import (
+        build_env_toml, write_env_pixi_toml, resolve_env_cuda_wheel_urls,
