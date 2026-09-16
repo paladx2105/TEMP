@@ -1,0 +1,865 @@
+Dies ist eine Kopie eines geteilten ChatGPT-Chats. Er wird nicht zur Erinnerung hinzugefügt.
+
+Gespräch melden
+heute 9:44
+hier waren wir stehen geblieben:
+
+#!/bin/bash
+
+COMFYUI_DIR="$HOME/.ComfyUI"
+
+export HSA_OVERRIDE_GFX_VERSION=10.3.0
+export TRELLIS_DIR="~/.trellis2"
+export HIP_VISIBLE_DEVICES=0
+
+export LD_LIBRARY_PATH="$TRELLIS_DIR/venv/lib/python3.12/site-packages/torch/lib:$LD_LIBRARY_PATH"
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+
+if [ ! -d "$COMFYUI_DIR" ]; then
+    echo "FEHLER: ComfyUI Verzeichnis nicht gefunden: $COMFYUI_DIR"
+    echo "Bitte den Pfad im Skript (Variable COMFYUI_DIR) anpassen."
+    exit 1
+fi
+
+if [ -f "$TRELLIS_DIR/venv/bin/activate" ]; then
+    source "$TRELLIS_DIR/venv/bin/activate"
+else
+    echo "FEHLER: Virtuelle Umgebung nicht gefunden unter $TRELLIS_DIR/venv"
+    echo "Bitte prüfen, ob ComfyUI wie beschrieben mit 'python3 -m venv venv' eingerichtet wurde."
+    exit 1
+fi
+
+cd "$TRELLIS_DIR" || exit 1
+
+echo "Starte ComfyUI mit HSA_OVERRIDE_GFX_VERSION=$HSA_OVERRIDE_GFX_VERSION ..."
+echo "Server wird unter http://127.0.0.1:8188 erreichbar sein."
+echo ""
+echo "Mit [STRG+C] wird ComfyUI vollständig beendet."
+echo ""
+
+# ComfyUI-Prozess beim Drücken von STRG+C beenden
+cleanup() {
+    echo ""
+    echo "STRG+C erkannt – beende ComfyUI..."
+
+    if [ -n "$COMFY_PID" ] && kill -0 "$COMFY_PID" 2>/dev/null; then
+        kill "$COMFY_PID" 2>/dev/null
+
+        # Kurz warten, damit der Prozess sauber beendet werden kann
+        sleep 1
+
+        # Falls noch vorhanden, hart beenden
+        if kill -0 "$COMFY_PID" 2>/dev/null; then
+            echo "Prozess reagiert nicht – erzwinge Beendigung."
+            kill -9 "$COMFY_PID" 2>/dev/null
+        fi
+    fi
+
+    echo "ComfyUI beendet."
+    exit 130
+}
+
+trap cleanup SIGINT SIGTERM
+
+
+python main.py \
+    --use-pytorch-cross-attention \
+    --lowvram &
+
+COMFY_PID=$!
+
+wait "$COMFY_PID"
+
+Ja. Wir waren bei diesem Startskript für ComfyUI innerhalb deiner Trellis2-venv, mit HSA_OVERRIDE_GFX_VERSION=10.3.0 für deine AMD-GPU.
+
+Ich sehe dabei direkt einen wichtigen Fehler, den wir als Nächstes korrigieren sollten:
+
+export TRELLIS_DIR="~/.trellis2"
+
+Das ~ wird innerhalb von Anführungszeichen nicht expandiert. Dadurch wird später effektiv mit einem Pfad wie
+
+~/.trellis2/venv/...
+
+gearbeitet statt mit
+
+/home/paladx2105/.trellis2/...
+
+Das betrifft insbesondere:
+
+source "$TRELLIS_DIR/venv/bin/activate"
+cd "$TRELLIS_DIR"
+export LD_LIBRARY_PATH="$TRELLIS_DIR/venv/lib/python3.12/site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+Wir sollten deshalb zunächst auf:
+
+export TRELLIS_DIR="$HOME/.trellis2"
+
+ändern.
+
+Außerdem war unser letzter technischer Ausgangspunkt dein Fehler:
+
+torch: 2.9.1+rocm6.4
+hip: 6.4.43484-123eb5128
+gpu: AMD Radeon Graphics
+capability: (10, 3)
+
+torch.AcceleratorError: HIP error: invalid device function
+
+Das heißt: ROCm/Torch erkennen die GPU grundsätzlich, aber mindestens ein ausgeführter HIP-Kernel ist für die tatsächlich verwendete GPU-Architektur nicht passend kompiliert. HSA_OVERRIDE_GFX_VERSION=10.3.0 ist dabei ein Workaround für die Architektur-Erkennung, garantiert aber nicht, dass sämtliche Torch-/Triton-/Trellis-Kernels damit funktionieren.
+
+Ich würde daher noch nicht weitere Pakete installieren oder Versionen ändern. Erst sollten wir das Startskript sauber machen und anschließend gezielt feststellen, welcher Kernel bzw. welche Komponente den invalid device function auslöst.
+
+Die erste korrigierte Fassung wäre:
+
+#!/bin/bash
+
+COMFYUI_DIR="$HOME/.ComfyUI"
+TRELLIS_DIR="$HOME/.trellis2"
+
+export HSA_OVERRIDE_GFX_VERSION=10.3.0
+export HIP_VISIBLE_DEVICES=0
+
+export LD_LIBRARY_PATH="$TRELLIS_DIR/venv/lib/python3.12/site-packages/torch/lib:$LD_LIBRARY_PATH"
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+
+if [ ! -d "$COMFYUI_DIR" ]; then
+    echo "FEHLER: ComfyUI Verzeichnis nicht gefunden: $COMFYUI_DIR"
+    echo "Bitte den Pfad im Skript (Variable COMFYUI_DIR) anpassen."
+    exit 1
+fi
+
+if [ -f "$TRELLIS_DIR/venv/bin/activate" ]; then
+    source "$TRELLIS_DIR/venv/bin/activate"
+else
+    echo "FEHLER: Virtuelle Umgebung nicht gefunden unter $TRELLIS_DIR/venv"
+    exit 1
+fi
+
+cd "$TRELLIS_DIR" || exit 1
+
+echo "=============================================="
+echo " Starte ComfyUI"
+echo "=============================================="
+echo "TRELLIS_DIR:             $TRELLIS_DIR"
+echo "COMFYUI_DIR:             $COMFYUI_DIR"
+echo "HSA_OVERRIDE_GFX_VERSION: $HSA_OVERRIDE_GFX_VERSION"
+echo "HIP_VISIBLE_DEVICES:      $HIP_VISIBLE_DEVICES"
+echo ""
+echo "Server: http://127.0.0.1:8188"
+echo "Beenden: STRG+C"
+echo ""
+
+cleanup() {
+    echo ""
+    echo "STRG+C erkannt – beende ComfyUI..."
+
+    if [ -n "$COMFY_PID" ] && kill -0 "$COMFY_PID" 2>/dev/null; then
+        kill "$COMFY_PID" 2>/dev/null
+
+        sleep 1
+
+        if kill -0 "$COMFY_PID" 2>/dev/null; then
+            echo "Prozess reagiert nicht – erzwinge Beendigung."
+            kill -9 "$COMFY_PID" 2>/dev/null
+        fi
+    fi
+
+    echo "ComfyUI beendet."
+    exit 130
+}
+
+trap cleanup SIGINT SIGTERM
+
+python main.py \
+    --use-pytorch-cross-attention \
+    --lowvram &
+
+COMFY_PID=$!
+
+wait "$COMFY_PID"
+
+Aber: Bevor wir das jetzt als endgültige Version festlegen, würde ich als nächsten Schritt einen kleinen Diagnoseblock direkt vor python main.py einsetzen. Damit können wir überprüfen, ob genau diese venv das richtige Torch/ROCm lädt und ob ein elementarer HIP-Tensor-Operationstest funktioniert. Das ist wesentlich aussagekräftiger als einfach ComfyUI erneut zu starten.
+
+Datei hochgeladen
+src/comfy_env/packages/toml_generator.py:48:    torch_index: Optional[str],
+src/comfy_env/packages/toml_generator.py:51:    """Build {torch, torchvision, torchaudio} pypi-deps, optionally with index attached.
+src/comfy_env/packages/toml_generator.py:55:    torch_index is set (Linux/Windows + CUDA path), the index is attached to
+src/comfy_env/packages/toml_generator.py:68:    if torch_index:
+src/comfy_env/packages/toml_generator.py:69:        return {pkg: {"version": pin, "index": torch_index}
+src/comfy_env/packages/toml_generator.py:78:_HOST_DERIVED_PKGS = ("comfy-aimdo", "comfy-kitchen")
+src/comfy_env/packages/toml_generator.py:232:    for pkg in _HOST_DERIVED_PKGS:
+src/comfy_env/packages/toml_generator.py:324:    torch_index: Optional[str],
+src/comfy_env/packages/toml_generator.py:355:    pypi = _torch_family_pypi(torch_pin, torch_index, log)
+src/comfy_env/packages/toml_generator.py:359:    _derived_names = _HOST_DERIVED_PKGS if host_derived else ()
+src/comfy_env/packages/toml_generator.py:377:        _is_cpu = not torch_index or "cpu" in str(torch_index).lower()
+src/comfy_env/packages/toml_generator.py:489:    torch_index: Optional[str],
+src/comfy_env/packages/toml_generator.py:492:    chosen_torch_index: Optional[str] = None,
+src/comfy_env/packages/toml_generator.py:510:        torch_index: Workspace-wide bootstrap torch index URL (cu*/cpu).
+src/comfy_env/packages/toml_generator.py:546:    if cuda_only and chosen_torch_pin and chosen_torch_index:
+src/comfy_env/packages/toml_generator.py:548:        node_torch_index: Optional[str] = chosen_torch_index
+src/comfy_env/packages/toml_generator.py:551:        node_torch_index = torch_index
+src/comfy_env/packages/toml_generator.py:561:        torch_index=node_torch_index,
+src/comfy_env/packages/toml_generator.py:603:    torch_index: Optional[str],
+src/comfy_env/packages/toml_generator.py:606:    chosen_torch_index: Optional[str] = None,
+src/comfy_env/packages/toml_generator.py:625:        torch_index=torch_index,
+src/comfy_env/packages/toml_generator.py:628:        chosen_torch_index=chosen_torch_index,
+src/comfy_env/install/workspace.py:48:    """Decide (torch_index, cuda_version, cuda_major, python_version, torch_version)
+src/comfy_env/install/workspace.py:60:    which has osx-arm64/osx-64 torch wheels. Linux/Windows + NVIDIA: cu* index
+src/comfy_env/install/workspace.py:118:        # Silicon). Returning None for torch_index lets pixi resolve from the
+src/comfy_env/install/workspace.py:125:        log("[comfy-env] No CUDA detected -- pinning comfyui torch to CPU index")
+src/comfy_env/install/workspace.py:129:    torch_index = f"https://download.pytorch.org/whl/{cu_tag}"
+src/comfy_env/install/workspace.py:134:        f"{torch_index} (CUDA {cuda_version} via {src})"
+src/comfy_env/install/workspace.py:136:    return torch_index, cuda_version, cuda_major, python_version, torch_version
+src/comfy_env/install/workspace.py:283:def _bootstrap_torch_pin(bootstrap_torch: Optional[str]) -> Optional[str]:
+src/comfy_env/install/workspace.py:308:    from ..packages.toml_generator import _HOST_DERIVED_PKGS, read_host_pin
+src/comfy_env/install/workspace.py:334:    for pkg in _HOST_DERIVED_PKGS:
+src/comfy_env/install/workspace.py:742:            torch_index, cuda_version, _cuda_major,
+src/comfy_env/install/workspace.py:752:        torch_pin: Optional[str] = _bootstrap_torch_pin(bootstrap_torch)
+src/comfy_env/install/workspace.py:753:        chosen_torch_index: Optional[str] = None
+src/comfy_env/install/workspace.py:757:            chosen_torch_index = (
+src/comfy_env/install/workspace.py:809:                torch_index=torch_index,
+src/comfy_env/install/workspace.py:812:                chosen_torch_index=chosen_torch_index,
+src/comfy_env/install/workspace.py:856:                torch_index=torch_index,
+src/comfy_env/install/workspace.py:859:                chosen_torch_index=chosen_torch_index,
+src/comfy_env/install/workspace.py:1015:        from ..packages.toml_generator import _HOST_DERIVED_PKGS, read_host_pin
+src/comfy_env/install/workspace.py:1019:        for _pkg in _HOST_DERIVED_PKGS:
+tests/test_passthrough.py:13:    kw.setdefault("torch_index", None)
+tests/test_passthrough.py:68:        torch_index=None, bootstrap_python="3.12", log=lambda m: None)
+tests/test_env_identity.py:7:    _bootstrap_torch_pin,
+tests/test_env_identity.py:17:    kw.setdefault("torch_index", None)
+tests/test_env_identity.py:85:    assert _bootstrap_torch_pin("2.10.3") == "==2.10.*"
+tests/test_env_identity.py:86:    assert _bootstrap_torch_pin("2.8.0") == "==2.8.*"
+tests/test_env_identity.py:87:    assert _bootstrap_torch_pin(None) is None
+tests/test_vram_offset.py:33:    mm.get_torch_device = lambda: types.SimpleNamespace(type="cuda", index=0)
+tests/test_memory_manager.py:221:    def _build(self, cfg, host, torch_index=CUDA_INDEX, **kw):
+tests/test_memory_manager.py:225:            cfg, "pack", "3.13", torch_pin="==2.8.*", torch_index=torch_index,
+tests/test_memory_manager.py:266:        pypi = self._build(cfg, self._host(tmp_path), torch_index=None)
+tests/test_config.py:36:    manifest = build_env_toml("t", cfg, torch_index=None, log=lambda m: None)
+tests/test_toml_generator.py:13:        torch_index="https://download.pytorch.org/whl/cpu",
+tests/test_toml_generator.py:35:    def _pypi(monkeypatch, torch_index):
+tests/test_toml_generator.py:45:            torch_index=torch_index,
+tests/test_toml_generator.py:81:            "somepack-nodes", parse_config({}), torch_index=None,
+tests/test_toml_generator.py:98:        from comfy_env.packages.toml_generator import _HOST_DERIVED_PKGS
+tests/test_toml_generator.py:101:                                    derived=_HOST_DERIVED_PKGS)
+tests/test_toml_generator.py:108:        from comfy_env.packages.toml_generator import _HOST_DERIVED_PKGS
+tests/test_toml_generator.py:112:                                    derived=_HOST_DERIVED_PKGS)
+tests/test_toml_generator.py:138:        from comfy_env.packages.toml_generator import _HOST_DERIVED_PKGS
+tests/test_toml_generator.py:141:                              derived=_HOST_DERIVED_PKGS)
+tests/test_reserve_publish.py:21:    mm.get_torch_device = lambda: types.SimpleNamespace(type="cuda", index=0)
+
+
+
+Gut. Damit ist ein wichtiger Punkt geklärt: torch_index=None bedeutet tatsächlich kein expliziter Index, also Default-PyPI. Die Torch-Familie wird trotzdem ganz normal mit dem Host-Pin erzeugt.
+
+Damit sollten wir noch keinen ROCm-Index erfinden. Der saubere Upstream-Fix kann möglicherweise darin bestehen, ROCm als eigenen Backend-Zweig zu behandeln und die vorhandene Default-PyPI-Mechanik zu verwenden — aber nur, wenn wir sehen, wie die Manifest-Erzeugung mit cuda_version/cuda_major und chosen_torch_index weiterarbeitet.
+
+Bitte gib noch genau diese drei Bereiche aus:
+
+cd "$HOME/comfy-env-dev"
+
+sed -n '320,410p' src/comfy_env/packages/toml_generator.py
+sed -n '480,575p' src/comfy_env/packages/toml_generator.py
+sed -n '720,875p' src/comfy_env/install/workspace.py
+
+Der letzte Block ist besonders wichtig, weil dort aus
+
+torch_index, cuda_version, cuda_major, ...
+
+anschließend chosen_torch_index und das tatsächliche pixi.toml erzeugt werden.
+
+Was ich danach ändern würde
+
+Nicht:
+
+if rocm:
+    return cpu_index
+
+und auch nicht:
+
+if rocm:
+    return None
+
+blind einsetzen.
+
+Sondern die vorhandene Backend-Abstraktion konsequent durch _resolve_workspace_torch() führen:
+
+detect_backend()
+       │
+       ├─ cuda → bestehende CUDA-Auflösung unverändert
+       ├─ rocm → kein get_recommended_cuda_version()
+       ├─ mps  → bestehende macOS-Logik
+       └─ cpu  → CPU-Index
+
+Dabei müssen wir sicherstellen, dass ROCm nicht als CPU und niemals als CUDA 12.8 interpretiert wird.
+
+Das ist jetzt der entscheidende letzte Teil, bevor wir den eigentlichen Patch schreiben.
+
+    cfg: ComfyEnvConfig,
+    name: str,
+    version: str,
+    torch_pin: Optional[str],
+    torch_index: Optional[str],
+    glibc_version: Optional[str],
+    log: Callable[[str], None] = print,
+    macos_version: Optional[str] = None,
+    cuda_wheel_urls: Optional[Dict[str, str]] = None,
+    comfyui_dir: Optional[Path] = None,
+    host_derived: bool = True,
+) -> Dict[str, Any]:
+    """Emit a self-contained pixi [feature.<name>.*] block for one env.
+
+    Each node env owns its full feature: python pin, pip/setuptools, glibc,
+    KMP env var, torch family pin (replicated from workspace -- see
+    _torch_family_pypi), and the node's own deps from comfy-env.toml.
+    No base feature is composed in. Plain torch/torchvision/torchaudio entries
+    in the node's own deps are stripped so they can't shadow the workspace pin.
+
+    pypi-options from the node's comfy-env.toml is passed through verbatim,
+    so a node author can still express [pypi-options.dependency-overrides]
+    manually to redirect a specific transitive resolution.
+    """
+    feat: Dict[str, Any] = {}
+
+    # Conda deps: base (python/pip/setuptools) + node's own
+    deps = _common_base_dependencies(version)
+    node_conda = copy.deepcopy(cfg.pixi_passthrough.get("dependencies", {}))
+    if node_conda:
+        _strip_torch_family(node_conda, name, "[dependencies]", log)
+        deps.update(node_conda)
+    feat["dependencies"] = deps
+
+    # PyPI deps: torch family pin (replicated workspace-wide) + node's own
+    pypi = _torch_family_pypi(torch_pin, torch_index, log)
+    host_pins = _host_derived_pypi(comfyui_dir, host_derived, log)
+    # Empty when the operator turned replication off, so the strip below is a
+    # no-op then: opting out must leave a pack's own declarations standing.
+    _derived_names = _HOST_DERIVED_PKGS if host_derived else ()
+    node_pypi = copy.deepcopy(cfg.pixi_passthrough.get("pypi-dependencies", {}))
+    if node_pypi:
+        _strip_torch_family(node_pypi, name, "[pypi-dependencies]", log)
+        # Substitute in place, and ONLY where the pack already declares the
+        # package. Adding it to a pack that never asked would put a native CUDA
+        # wheel into CPU-only envs and change every env's identity, which is a
+        # far larger blast radius than the drift this exists to fix.
+        pypi.update(_replace_host_derived(node_pypi, host_pins, name,
+                                          log=log, derived=_derived_names))
+        pypi.update(node_pypi)
+    # Inject even when the pack never asked. These are not the pack's
+    # dependencies to declare: the HOST's ComfyUI imports them unguarded, so a
+    # worker that lacks one cannot import comfy at all, and a worker cannot be
+    # made transparent later without them. Absence is the expensive mistake.
+    # Only envs that have torch at all are candidates; within those, the
+    # CUDA-only set is skipped on a CPU stack.
+    if torch_pin:
+        _is_cpu = not torch_index or "cpu" in str(torch_index).lower()
+        for pkg, wanted in host_pins.items():
+            if _is_cpu and pkg in _HOST_CUDA_ONLY_PKGS:
+                continue
+            pypi.setdefault(pkg, wanted)
+    # CUDA wheels, inlined as direct-URL deps (may carry a #sha256= fragment,
+    # which pixi records in the lock and uv verifies). The wheels' in-farm
+    # METADATA declares no dependencies, so a URL dep is exactly the
+    # --no-deps semantics the retired post-pixi uv pass had -- but inside
+    # pixi.lock, hashed, cached, and safe against a plain pixi install.
+    # Merged LAST so neither the torch pin nor an author entry shadows it.
+    if cuda_wheel_urls:
+        for _pkg, _url in sorted(cuda_wheel_urls.items()):
+            _key = _pkg.lower().replace("_", "-")
+            pypi[_key] = {"url": _url}
+    if pypi:
+        feat["pypi-dependencies"] = pypi
+
+    # Per-target sections (only the current platform's), with torch family stripped
+    targets = cfg.pixi_passthrough.get("target", {})
+    current = get_pixi_platform()
+    if current in targets:
+        cur_target = copy.deepcopy(targets[current])
+        for tbl in ("dependencies", "pypi-dependencies"):
+            if tbl in cur_target:
+                _strip_torch_family(
+                    cur_target[tbl], name,
+                    f"[target.{current}.{tbl}]", log,
+                )
+                if tbl == "pypi-dependencies":
+                    # A target table wins over the feature table on its own
+                    # platform, so an unpinned aimdo left here would silently
+                    # beat the host pin we just substituted above.
+                    pypi.update(_replace_host_derived(
+
+        return {"torch": torch_pin}
+    vision_pin, audio_pin = family
+    return {"torch": torch_pin, "torchvision": vision_pin, "torchaudio": audio_pin}
+
+
+
+def build_env_toml(
+    env_name: str,
+    cfg: ComfyEnvConfig,
+    torch_index: Optional[str],
+    bootstrap_python: Optional[str] = None,
+    torch_pin: Optional[str] = None,
+    chosen_torch_index: Optional[str] = None,
+    chosen_torch_pin: Optional[str] = None,
+    log: Callable[[str], None] = print,
+    cuda_wheel_urls: Optional[Dict[str, str]] = None,
+    comfyui_dir: Optional[Path] = None,
+    host_derived: bool = True,
+) -> Dict[str, Any]:
+    """Build a self contained pixi.toml dict for one isolated env.
+
+    Each env gets its own manifest declaring a single feature `node
+    and a single environment `default. No solve-groups, no cross-env
+    references. A parse error in one env's pixi.toml has zero effect on
+    any other env.
+
+    Args:
+        env_name: Logical env name (used in workspace/name only, not as the
+            pixi environment name -- that's always `default).
+        cfg: Node's parsed comfy-env.toml.
+        torch_index: Workspace-wide bootstrap torch index URL (cu*/cpu).
+        torch_pin: Workspace-wide bootstrap torch version pin (`==X.Y.Z).
+        chosen_*: Override combo for cuda-only nodes (from cuda-wheel resolver).
+    """
+    host_py = bootstrap_python or f"{sys.version_info.major}.{sys.version_info.minor}"
+    current_platform = get_pixi_platform()
+
+    _validate_node_config(env_name, cfg)
+    _validate_passthrough(env_name, cfg)
+
+    # Workspace-section channels: conda-forge + any extras from this node's config
+    channels: List[str] = ["conda-forge"]
+    for ch in cfg.pixi_passthrough.get("workspace", {}).get("channels", []):
+        if ch not in channels:
+            channels.append(ch)
+
+    # Auto-detect host glibc.
+    import platform as _platform
+    libc_family, libc_version = _platform.libc_ver()
+    glibc_version: Optional[str] = None
+    if libc_family == "glibc" and libc_version:
+        glibc_version = libc_version
+
+    # Auto-detect torch's macOS wheel floor. pixi defaults osx-arm64 to
+    # macOS 13, but torch 2.12+ only ships macosx_14_0_arm64 wheels — so
+    # without this, pixi solve fails with "no matching platform tag".
+    macos_version: Optional[str] = None
+    if sys.platform == "darwin":
+        from ..detection.cuda import get_bootstrap_torch_macos_min
+        macos_version = get_bootstrap_torch_macos_min()
+        if macos_version:
+            log(f"[comfy-env] Torch wheel targets macOS {macos_version}+ "
+                f"-> emitting system-requirements macos={macos_version}")
+
+    # cuda-wheel-only nodes use the override combo; everyone else gets bootstrap.
+    cuda_only = [p for p in cfg.cuda_packages if p not in _TORCH_PKGS]
+    if cuda_only and chosen_torch_pin and chosen_torch_index:
+        node_torch_pin: Optional[str] = chosen_torch_pin
+        node_torch_index: Optional[str] = chosen_torch_index
+    else:
+        node_torch_pin = torch_pin
+        node_torch_index = torch_index
+
+    env_python = cfg.python or host_py
+    # Feature name MUST NOT be "default" -- pixi reserves that name for the
+    # implicit feature that picks up any tables at the toml root, and refuses
+    # to parse a manifest that declares [feature.default.*] explicitly.
+    # Use "node" instead; the user-facing pixi environment name stays "default".
+    feat = _build_node_feature(
+        cfg, env_name, env_python,
+        torch_pin=node_torch_pin,
+        torch_index=node_torch_index,
+        glibc_version=glibc_version,
+        macos_version=macos_version,
+        log=log,
+        cuda_wheel_urls=cuda_wheel_urls,
+        comfyui_dir=comfyui_dir,
+        host_derived=host_derived,
+    )
+
+    # Platform entry: the modern spelling of what [system-requirements]
+    # carried -- pixi 0.75 accepts glibc/macos (and cuda etc.) as keys on a
+    # workspace platforms entry and deprecates the table. Same solver input,
+    # no deprecation warning. Skipped when the author declared their own
+    # [system-requirements], so the constraint is stated exactly once.
+    platform_entry: Any = current_platform
+
+        return workspace_dir
+    if derive and len(derive) < len(discovered):
+        log(
+            f"[comfy-env] {len(derive)}/{len(discovered)} env(s) need a "
+            f"derivation check: {', '.join(derive)} (others clean, skipped)"
+        )
+
+    tee_log = InstallLog(log)
+
+    try:
+        log = tee_log
+        log(f"[comfy-env] Workspace: {workspace_dir}")
+        log(f"[comfy-env] ComfyUI: {comfyui_dir}")
+        log(f"[comfy-env] Found {len(discovered)} node config(s):")
+        for env_name, plugin_dir, cf, cfg in discovered:
+            try:
+                rel = cf.relative_to(comfyui_dir)
+            except ValueError:
+                rel = cf
+            log(f"  - {env_name} <- {rel} (python={cfg.python or 'host'})")
+
+        (
+            torch_index, cuda_version, _cuda_major,
+            bootstrap_python, bootstrap_torch,
+        ) = _resolve_workspace_torch(log)
+
+        # Pre-validate cuda-wheel availability against the v2 index. May downgrade
+        # the workspace's torch/cuda to a known-good combo if the bootstrap one
+        # has unpublished wheels. Returns None on macOS / CPU / no cuda-only deps.
+        combo = _resolve_wheel_combo(
+            discovered, bootstrap_python, cuda_version, bootstrap_torch, log,
+        )
+        torch_pin: Optional[str] = _bootstrap_torch_pin(bootstrap_torch)
+        chosen_torch_index: Optional[str] = None
+        chosen_torch_pin_for_override: Optional[str] = None
+        if combo is not None:
+            _, chosen_cuda, chosen_torch_short, chosen_torch_pin_for_override, combo_src = combo
+            chosen_torch_index = (
+                f"https://download.pytorch.org/whl/cu"
+                f"{chosen_cuda.replace('.', '')[:3]}"
+            )
+        else:
+            # Never observed: both reads below are guarded on
+            # combo is not None. Bound only so the names exist.
+            chosen_cuda = chosen_torch_short = None
+
+        # On Desktop app, requirements.txt is in the app bundle (source dir),
+        # not the user data dir. Resolve source dir separately for downstream use.
+        from ..environment.cache import find_comfyui_source_dir
+        source_dir = find_comfyui_source_dir(comfyui_dir / "custom_nodes")
+        if source_dir and source_dir != comfyui_dir:
+            log(f"[comfy-env] Desktop app detected: source={source_dir}, data={comfyui_dir}")
+
+        # Level-2 derivation for each candidate env: build the manifest
+        # in memory + resolve wheel URLs, then compare the OUTPUT identity
+        # with the stored one. Only a real identity change rebuilds;
+        # matches (comment edits, version bumps, fallback probe that found
+        # nothing new) just refresh the hash file. Grandfather: a legacy
+        # v1 hash with a materialized env is accepted as-built once.
+        _derive_set = set(derive)
+        candidates = [d for d in discovered if d[0] in _derive_set]
+        to_install = []
+        env_identity: Dict[str, str] = {}
+        cuda_urls_by_env: Dict[str, Dict[str, str]] = {}
+        for env_name, _plugin, _cf, cfg in candidates:
+            env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
+            # URLs first: they are INPUTS to the manifest now, inlined as
+            # direct-URL pypi-dependencies rather than fed to a post-pixi
+            # uv pass (which no longer exists).
+            urls = resolve_env_cuda_wheel_urls(
+                cfg=cfg,
+                bootstrap_python=bootstrap_python,
+                chosen_cuda=chosen_cuda if combo is not None else None,
+                chosen_torch_short=chosen_torch_short if combo is not None else None,
+                log=log,
+            )
+            cuda_urls_by_env[env_name] = urls
+            # SILENT. This build exists only to hash the plan and compare it
+            # to last time's (seal 2, see seals.md); write_env_pixi_toml
+            # builds the same manifest again to write it, and both used to
+            # narrate, so every "replicating host pin" and every overruled
+            # pin printed twice per env. Narrating here is also wrong for a
+            # second reason: this pass runs for EVERY env including the ones
+            # about to be skipped, so an env that is not changing would
+            # explain a manifest nobody is going to write. The write pass
+            # runs only for genuinely stale envs, which is exactly when the
+            # reader wants to know what went into the file.
+            manifest = build_env_toml(
+                env_name, cfg,
+                torch_index=torch_index,
+                bootstrap_python=bootstrap_python,
+                torch_pin=torch_pin,
+                chosen_torch_index=chosen_torch_index,
+                chosen_torch_pin=chosen_torch_pin_for_override,
+                log=lambda _msg: None,
+                cuda_wheel_urls=urls,
+                comfyui_dir=comfyui_dir,
+            )
+            identity = _env_identity(manifest, list(urls.values()))
+            env_identity[env_name] = identity
+            materialized = _env_dir_of(workspace_dir, env_name).is_dir()
+
+            if (not dry_run and materialized
+                    and identity == stored_identity[env_name]):
+                _write_hash_file(env_manifest_dir / _INSTALL_HASH_FILE,
+                                 identity, fast_keys[env_name], log)
+                log(f"[comfy-env] {env_name}: derivation unchanged -- skipping")
+                continue
+            if (not dry_run and materialized and legacy_v1[env_name]
+                    and stored_identity[env_name] is None):
+                _write_hash_file(env_manifest_dir / _INSTALL_HASH_FILE,
+                                 identity, fast_keys[env_name], log)
+                log(
+                    f"[comfy-env] {env_name}: legacy install.hash grandfathered "
+                    f"-- env accepted as-built, identity tracking starts now"
+                )
+                continue
+
+            to_install.append((env_name, _plugin, _cf, cfg))
+            if urls:
+                log(
+                    f"[comfy-env] {env_name}: cuda-wheels inlined into the "
+                    f"manifest ({', '.join(urls.keys())})"
+                )
+
+        # Emit one pixi.toml per genuinely-stale env. Clean envs keep their
+        # manifest untouched (identical content, but no mtime churn and no
+        # clobbering of another install's manifest).
+        log(f"[comfy-env] Writing {len(to_install)} per-env manifest(s):")
+        for env_name, _plugin, _cf, cfg in to_install:
+            env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
+            tee_log.begin(env_name, env_manifest_dir)
+            write_env_pixi_toml(
+                env_manifest_dir=env_manifest_dir,
+                env_name=env_name,
+                cfg=cfg,
+                torch_index=torch_index,
+                bootstrap_python=bootstrap_python,
+                torch_pin=torch_pin,
+                chosen_torch_index=chosen_torch_index,
+                chosen_torch_pin=chosen_torch_pin_for_override,
+                log=log,
+                cuda_wheel_urls=cuda_urls_by_env.get(env_name),
+                comfyui_dir=comfyui_dir,
+            )
+            log(f"  - {env_name}: {env_manifest_dir / 'pixi.toml'}")
+            tee_log.end()
+
+        if dry_run:
+            log("[comfy-env] dry_run -- skipping pixi install")
+            return workspace_dir
+
+        _patch_uv_platform_py(log)
+
+        pixi_env = dict(os.environ)
+        pixi_env["UV_PYTHON_INSTALL_DIR"] = str(workspace_dir / "_no_python")
+
+
+
+Ja — damit ist der entscheidende Datenfluss jetzt sichtbar.
+
+Wichtig: Der ROCm-Fehler sitzt nicht im toml_generator.py selbst. Der Generator reicht torch_index nur weiter. Das Problem entsteht vorher in _resolve_workspace_torch():
+
+ROCm Torch 2.13.0+rocm10.0.0
+        │
+        ├─ detect_backend() → ("rocm", "10.0.0")
+        │
+        └─ aktueller _resolve_workspace_torch()
+              │
+              └─ get_recommended_cuda_version()
+                    │
+                    └─ GPU capability (10,3)
+                          │
+                          └─ fälschlich CUDA 12.8
+                                │
+                                └─ torch_index = .../cu128
+
+Der toml_generator macht danach genau das, was ihm übergeben wurde:
+
+pypi = _torch_family_pypi(torch_pin, torch_index, log)
+
+und dadurch entsteht:
+
+torch = { version = "==2.13.*", index = "https://download.pytorch.org/whl/cu128" }
+Was ich für den Upstream-Patch ändern würde
+
+Da detection/backend.py bereits vorhanden ist und ausdrücklich rocm erkennt, sollten wir nicht noch eine zweite ROCm-Erkennung bauen.
+
+Der Patch sollte _resolve_workspace_torch() auf detect_backend() umstellen:
+
+backend == "cuda"
+    → bisheriger CUDA-Pfad
+
+backend == "rocm"
+    → ROCm-Torch vom Host übernehmen
+    → KEINE CUDA-Erkennung
+    → KEIN cu128
+    → KEIN CPU-Fallback
+
+backend == "cpu"
+    → CPU-Pfad
+
+backend == "mps"
+    → bestehender macOS-Pfad
+
+Der entscheidende Punkt ist noch welcher torch_index für ROCm zurückgegeben werden soll. Aus dem bisher gezeigten Code lässt sich das noch nicht sicher ableiten. Wir sollten hier nicht einfach einen ROCm-PyTorch-Index erfinden, weil cuda_wheels.py bereits eine Backend-Registry besitzt.
+
+Daher ist als nächster Schritt genau diese Stelle wichtig:
+
+cd "$HOME/comfy-env-dev"
+
+sed -n '1,180p' src/comfy_env/packages/cuda_wheels.py
+sed -n '1,150p' src/comfy_env/install/workspace.py
+sed -n '1,120p' src/comfy_env/detection/__init__.py
+
+Insbesondere interessiert mich in cuda_wheels.py:
+
+resolve_index_url("rocm")
+resolve_fallback_combo("rocm", ...)
+
+Denn wenn rocm dort bereits vorgesehen ist, können wir den Patch vollständig backend-generisch machen, statt ROCm als Sonderfall in workspace.py einzubauen.
+
+Bis dahin bitte nichts installieren und nichts am aktuellen ComfyUI-/Torch-Setup ändern. Der Upstream-Patch sollte ausschließlich in ~/comfy-env-dev auf fix/rocm-detection erfolgen.
+
+__init__.py.txt
+
+cuda_wheels.py.txt
+
+workspace.py.txt
+
+Ja. Ich habe die drei von dir verlinkten Dateien geprüft.
+
+Der entscheidende Punkt ist jetzt eindeutig:
+
+1. detect_backend() ist bereits die richtige Abstraktion
+
+__init__.py exportiert bereits:
+
+from .backend import (
+    detect_backend,
+    KNOWN_BACKENDS,
+)
+
+Damit muss workspace.py nicht selbst ROCm über GPU-Capability erkennen.
+
+2. cuda_wheels.py unterstützt ROCm bewusst noch nicht
+
+Die Registry enthält aktuell:
+
+WHEEL_INDEX_REGISTRY = {
+    "cuda": {
+        ...
+    },
+    # "rocm": {"index": ROCM_WHEELS_INDEX, "fallback_combo": (...)},
+}
+
+Das ist ein sehr wichtiger Hinweis: ROCm soll hier offenbar später additiv ergänzt werden, aber der jetzige Code behandelt den Bootstrap-Pfad noch ausschließlich als CUDA/CPU.
+
+Wir sollten deshalb nicht einfach rocm in WHEEL_INDEX_REGISTRY eintragen. Dafür fehlen in diesem Code noch die Definitionen für ROCm-Fallbacks und die dazugehörige Wheel-Matrix.
+
+3. Der eigentliche Bug sitzt exakt in _resolve_workspace_torch()
+
+Aktuell:
+
+bootstrap_cuda = get_bootstrap_torch_cuda()
+
+Das ist bei deinem:
+
+torch 2.13.0+rocm10.0.0
+
+korrekt None.
+
+Danach kommt aber:
+
+cuda_version = bootstrap_cuda or get_recommended_cuda_version()
+
+und genau hier wird ROCm fälschlicherweise zu CUDA.
+
+Die vorhandene GPU-Erkennung sieht durch torch.cuda deine AMD-Karte und liefert (10, 3). get_recommended_cuda_version() interpretiert das als CUDA-Architektur und erzeugt 12.8. Danach wird:
+
+https://download.pytorch.org/whl/cu128
+
+erzeugt.
+
+Das erklärt exakt deinen ursprünglichen Fehler.
+
+Der richtige Upstream-Patch
+
+Ich würde zunächst nur workspace.py und Tests ändern.
+
+Für ROCm sollte der Workspace die ROCm-Version des Bootstrap-Torch-Builds erkennen und einen ROCm-PyTorch-Index verwenden.
+
+Das ist auch konsistent mit der offiziellen PyTorch-Struktur: PyTorch veröffentlicht ROCm-Wheels über eigene rocmX.Y-Indizes, analog zu cuXXX. Für 2.13.0 sind beispielsweise rocm7.1 und rocm7.2 offiziell dokumentiert.
+
+Dein rocm10.0.0 ist dabei besonders interessant: Die aktuelle offizielle Wheel-Index-Seite enthält ROCm-Versionen und sogar rocm10.0 im PyTorch-Wheel-Repository.
+
+Ich würde die Architektur deshalb so ändern:
+detect_backend()
+       │
+       ├── cuda
+       │     └── bestehender CUDA-Code
+       │
+       ├── rocm
+       │     └── ROCm-Torch-Index
+       │
+       ├── mps
+       │     └── bestehender macOS-Code
+       │
+       └── cpu
+             └── CPU-Index
+
+Und ganz wichtig:
+
+ROCm darf niemals get_recommended_cuda_version() durchlaufen.
+
+Eine zusätzliche Änderung ist notwendig
+
+Aktuell liefert workspace.py nur:
+
+(
+    torch_index,
+    cuda_version,
+    cuda_major,
+    python_version,
+    torch_version,
+)
+
+Für ROCm wäre die sauberere interne Semantik:
+
+(
+    torch_index,
+    accelerator_version,
+    accelerator_major,
+    python_version,
+    torch_version,
+)
+
+oder wir behalten die bestehenden Rückgabewerte aus Kompatibilitätsgründen und verwenden bei ROCm:
+
+cuda_version = None
+cuda_major = None
+
+Das halte ich sogar für die bessere erste Upstream-Änderung, weil der Rest des Codes cuda_version aktuell gezielt für cuda-wheels verwendet.
+
+Damit wäre:
+
+ROCm:
+torch_index = https://download.pytorch.org/whl/rocm10.0
+cuda_version = None
+cuda_major = None
+
+und somit kann _resolve_wheel_combo() gar nicht versehentlich CUDA-Wheels auswählen.
+
+Aber: eine Sache müssen wir vor dem Patch noch prüfen
+
+Dein cuda_wheels.py hat aktuell explizit:
+
+resolve_fallback_combo(backend="cuda")
+
+und die Registry kennt nur CUDA.
+
+Deshalb möchte ich vor dem eigentlichen Commit noch prüfen, wie _resolve_wheel_combo() mit cuda_version=None umgeht.
+
+Das ist der letzte relevante Punkt, bevor wir den Patch schreiben.
+
+Führe in deinem ~/comfy-env-dev bitte aus:
+
+cd "$HOME/comfy-env-dev"
+
+grep -n -B15 -A80 "def _resolve_wheel_combo" src/comfy_env/install/workspace.py
+
+und:
+
+grep -Rni \
+  "resolve_fallback_combo\|resolve_index_url\|_resolve_wheel_combo" \
+  src/comfy_env tests
+
+Dann können wir den Patch gezielt und klein bauen, statt an mehreren Stellen unnötig herumzuändern.
+
+Die bisherige Analyse bestätigt jedenfalls: toml_generator.py muss für den grundlegenden ROCm-Erkennungsfehler nicht geändert werden. Der Fehler entsteht davor in _resolve_workspace_torch().
