@@ -1,0 +1,180 @@
+"""CUDA wheels index integration. See: https://pozzettiandrea.github.io/cuda-wheels/"""
+
+import json
+import logging
+import re
+import socket
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+from typing import Callable, List, Optional
+
+from ..detection.arch import cpu_arch
+
+try:
+    from importlib.metadata import version as _pkg_version
+    _UA = f"comfy-env/{_pkg_version('comfy-env')}"
+except Exception:
+    _UA = "comfy-env/unknown"
+
+logger = logging.getLogger("comfy-env.cuda-wheels")
+
+CUDA_WHEELS_INDEX_DEFAULT = "https://comfy-forge.github.io/cuda-wheels/"
+
+
+def cuda_wheels_index() -> str:
+    """The cuda-wheels index base URL, with a trailing slash.
+
+    Override with the ``COMFY_ENV_CUDA_WHEELS_INDEX`` environment variable.
+    The point is mirrors: an air-gapped or bandwidth-limited site can serve
+    the same directory listing from its own host without patching comfy-env.
+
+    Resolved per call rather than frozen at import so a test or a caller can
+    change it without reloading the module.
+
+    !! This URL is a TRUST boundary. What it serves is inlined into the
+    generated pixi manifest as a direct-URL pypi-dependency and installed by
+    pixi into the isolated env, where it executes at import time. It is
+    hash-verified only where the index attaches a ``#sha256=`` fragment to
+    the link (``toml_generator._resolve_cuda_wheels`` preserves the fragment;
+    it does not invent one). Point it only at an index you control or trust
+    as much as the default (ADR-0026).
+    """
+    import os
+    raw = (os.environ.get("COMFY_ENV_CUDA_WHEELS_INDEX") or "").strip()
+    if not raw:
+        return CUDA_WHEELS_INDEX_DEFAULT
+    # Every call site does f"{index}{pkg}/", so a missing trailing slash would
+    # silently build ".../v2flash_attn/" instead of failing.
+    return raw if raw.endswith("/") else raw + "/"
+
+
+# Back-compat alias for readers that want the default without calling.
+CUDA_WHEELS_INDEX = CUDA_WHEELS_INDEX_DEFAULT
+
+
+def _ssl_context() -> Optional[ssl.SSLContext]:
+    """Build an SSL context using certifi's CA bundle when available.
+
+    Portable/embedded Python distributions (e.g. ComfyUI's python_embeded) often ship
+    without a complete CA store, which makes urllib fail with CERTIFICATE_VERIFY_FAILED
+    against hosts whose chain isn't in the stripped default store (notably GitHub Pages).
+    certifi is effectively always present (pip depends on it), so prefer it when we can.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return None
+
+# Tier-2 fallback combo. Only consulted by the install pipeline (see
+# install._resolve_wheel_combo) when the host's bootstrap (python, cuda, torch)
+# combo doesn't have every required cuda-wheel published. Keep this aligned with
+# the cuda-wheels build matrix's known-good baseline.
+CUDA_TORCH_MAP = {"12.8": "2.8", "12.4": "2.4"}
+FALLBACK_COMBO = ("12.8", "2.8")  # (cuda, torch) -- always paired with bootstrap python
+
+# ...except on linux aarch64, which is a different world and gets its own cell.
+# Three things rule out simply reusing the x86 combo, or nudging one axis of it:
+#
+#   * (12.8, 2.8) does not exist on ARM. PyTorch shipped no linux-aarch64 wheel
+#     for the whole 2.8 line on cu128 -- torch 2.8.0, torchvision 0.23.0 and
+#     torchaudio 2.8.0 are x86_64/win_amd64 only there. The aarch64 cu128 build
+#     broke during the 2.8 cycle (pytorch#157548) and came back for 2.9.
+#   * (13.0, 2.8) does not exist anywhere: PyTorch's CUDA 13 line starts at
+#     torch 2.9, so 2.8 cannot reach it on any platform.
+#   * Staying on 12.8/12.9 leaves Thor DEAD. Their ARM arch list is
+#     `8.0;9.0+PTX;10.0;12.0+PTX` -- sm_110 has no cubin at or below it (the
+#     10.0 cubin cannot cross a major, the 12.0 PTX is above), so a Thor gets
+#     cudaErrorNoKernelImageForDevice at first kernel launch. 13.0's ARM list
+#     adds 11.0 natively.
+#
+# So ARM takes (13.0, 2.10): every current ARM CUDA product is covered (Grace
+# sm_90, GB200 sm_100, Thor sm_110, Orin sm_87 via the 8.0 cubin), and from
+# torchvision 0.25 / torchaudio 2.10 the ARM wheels are CUDA-tagged (+cu130)
+# rather than the plain CPU-only builds cu128/cu129 carry at that torch level.
+# Cost, stated plainly: CUDA 13 needs driver r580+.
+FALLBACK_COMBO_AARCH64 = ("13.0", "2.10")
+
+# Backend -> wheel-index registry. Data, not an `if backend ==`: callers go
+# through resolve_index_url(backend) rather than hardcoding an index.
+WHEEL_INDEX_REGISTRY: dict[str, dict] = {
+    "cuda": {
+        # Resolved lazily via resolve_index_url() -- see cuda_wheels_index().
+        "index": None,
+        # Keyed by CPU arch: the fallback is a claim about published wheels, and
+        # what upstream publishes differs per architecture.
+        "fallback_combo": {
+            "x86_64": FALLBACK_COMBO,
+            "aarch64": FALLBACK_COMBO_AARCH64,
+        },
+    },
+    # "rocm": {"index": ROCM_WHEELS_INDEX, "fallback_combo": (...)},  # additive later
+}
+
+
+def resolve_index_url(backend: str = "cuda") -> str:
+    """Wheel-index base URL for a backend. Raises for an unregistered backend."""
+    try:
+        WHEEL_INDEX_REGISTRY[backend]          # membership check
+        if backend == "cuda":
+            return cuda_wheels_index()
+        return WHEEL_INDEX_REGISTRY[backend]["index"]
+    except KeyError:
+        raise ValueError(
+            f"no wheel index registered for backend {backend!r}; "
+            f"known: {sorted(WHEEL_INDEX_REGISTRY)}"
+        ) from None
+
+
+def resolve_fallback_combo(backend: str = "cuda", arch: Optional[str] = None) -> tuple:
+    """Tier-2 (toolkit, torch) fallback combo for a backend on this machine's CPU.
+
+    `arch` overrides the detected architecture (for tests); it must be one of
+    the keys registered for the backend.
+    """
+    try:
+        combos = WHEEL_INDEX_REGISTRY[backend]["fallback_combo"]
+    except KeyError:
+        raise ValueError(f"no fallback combo registered for backend {backend!r}") from None
+    arch = arch or cpu_arch()
+    try:
+        return combos[arch]
+    except KeyError:
+        raise ValueError(
+            f"no {backend} fallback combo registered for CPU arch {arch!r}; "
+            f"known: {sorted(combos)}"
+        ) from None
+
+# torch.minor -> (torchvision_minor, torchaudio_minor). Used as a fallback
+# when the bootstrap venv doesn't have torchvision/torchaudio installed
+# (bare-env cases). For Desktop / any bootstrap that already has the family
+# installed, `derive_family_pins` reads the actual installed versions instead
+# — auto-tracks decouplings like torch 2.12 shipping without a matching
+# torchaudio (latest torchaudio for that torch line is 2.11).
+TORCH_FAMILY_COMPAT: dict = {
+    "2.4":  ("0.19", "2.4"),
+    "2.5":  ("0.20", "2.5"),
+    "2.6":  ("0.21", "2.6"),
+    "2.7":  ("0.22", "2.7"),
+    "2.8":  ("0.23", "2.8"),
+    "2.9":  ("0.24", "2.9"),
+    "2.10": ("0.25", "2.10"),
+    "2.11": ("0.26", "2.11"),
+    "2.12": ("0.27", "2.11"),   # torchaudio never shipped 2.12; stuck at 2.11
+}
+
+
+def derive_family_pins(torch_pin: str) -> Optional[tuple]:
+    """Given a torch pin like '==2.11.0' or '==2.8.*', return
+    `(torchvision_pin, torchaudio_pin)` as `==X.Y.*` specs.
+
+    Prefers the bootstrap venv's actually-installed versions when torch_pin
+    matches bootstrap torch — auto-tracks releases like the missing
+    torchaudio 2.12 without needing a table update. Falls back to
+    `TORCH_FAMILY_COMPAT` otherwise (bare envs, cuda-wheel-resolver
+    fallback combos that differ from bootstrap, etc).
+    """
+    m = re.match(r"==\s*(\d+)\.(\d+)", torch_pin)
