@@ -1,0 +1,66 @@
+==============================================
+ Starte ComfyUI
+==============================================
+TRELLIS_DIR:             /home/paladx2105/.trellis2
+COMFYUI_DIR:             /home/paladx2105/.ComfyUI
+HSA_OVERRIDE_GFX_VERSION: 10.3.0
+HIP_VISIBLE_DEVICES:      0
+
+Server: http://127.0.0.1:8188
+Beenden: STRG+C
+
+[START] Security scan
+[DONE] Security scan
+## ComfyUI-Manager: installing dependencies done.
+** ComfyUI startup time: 2026-09-16 15:25:34.748
+** Platform: Linux
+** Python version: 3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]
+** Python executable: /home/paladx2105/.trellis2/venv/bin/python
+** ComfyUI Path: /home/paladx2105/.ComfyUI
+** ComfyUI Base Folder Path: /home/paladx2105/.ComfyUI
+** User directory: /home/paladx2105/.ComfyUI/user
+** ComfyUI-Manager config path: /home/paladx2105/.ComfyUI/user/__manager/config.ini
+** Log path: /home/paladx2105/.ComfyUI/user/comfyui.log
+[BD TRELLIS2] Added to path: /home/paladx2105/.ComfyUI/custom_nodes/ComfyUI-TRELLIS2
+[BD TRELLIS2] trellis2 package available
+============================================================
+ComfyUI-BrainDead v2.0.0 (V3 API)
+Created by BizaNator for BrainDeadGuild.com
+Loaded 154 custom nodes:
+  - Cache: 20 nodes
+  - Mesh: 33 nodes
+  - Blender: 12 nodes
+  - TRELLIS2: 9 nodes
+  - Character: 4 nodes
+  - Prompt: 5 nodes
+  - Segmentation: 46 nodes
+  - Depth: 2 nodes
+  - FaceWrap: 11 nodes
+  - GLSL: 1 nodes
+  - Pixal3D: 2 nodes
+  - CubePart: 2 nodes
+  - AutoRig:  7 nodes
+============================================================
+ComfyUI-Multiband loaded: 15 nodes registered
+[2026-09-16 15:25:41.590] [info] Library path: /home/paladx2105/.trellis2/venv/lib/python3.12/site-packages/meshlib/../meshlib.libs/libMRMesh-c44716f3.so
+[2026-09-16 15:25:41.590] [info] Library path in canonical form: /home/paladx2105/.trellis2/venv/lib/python3.12/site-packages/meshlib.libs/libMRMesh-c44716f3.so
+[2026-09-16 15:25:41.590] [info] Executable path: /usr/bin/python3.12
+[SPARSE] Conv backend: flex_gemm; Attention backend: flash_attn
+[ATTENTION] Using backend: flash_attn
+[36m[ComfyUI-QwenVL][0m v[93m2.3.1[0m | [37m7 nodes[0m [92mLoaded[0m
+Error loading /home/paladx2105/.ComfyUI/custom_nodes/comfyui-rmbg/py/AILab_SAM3Segment.py: No module named 'decord'
+Error loading /home/paladx2105/.ComfyUI/custom_nodes/comfyui-rmbg/py/AILab_SAM3Segment.py: No module named 'decord'
+[34m[ComfyUI-RMBG][0m v[93m3.1.0[0m | [93m42 nodes[0m [92mLoaded[0m
+[34m[ComfyUI-Easy-Use] server: [0mv1.3.6 [92mLoaded[0m
+[34m[ComfyUI-Easy-Use] web root: [0m/home/paladx2105/.ComfyUI/custom_nodes/comfyui-easy-use/web_version/v2 [92mLoaded[0m
+[Angelo/SAM3 post-install] /home/paladx2105/.ComfyUI/custom_nodes/comfyui-rmbg/models/sam3/model_builder.py: skipped — no top-level `import pkg_resources` found (upstream may have fixed it; nothing to do)
+[Angelo/SAM3 post-install] note: sam3/model_builder.py looked different from the version we patch. If SAM 3 later fails to import with "No module named 'pkg_resources'", see issue #34.
+[Angelo/SAM3 post-install] no sam3/perflib/fused.py found (nothing to patch — fine if SAM 3 isn't installed yet).
+
+[92m[rgthree-comfy] Loaded 48 extraordinary nodes. 🎉[0m
+
+[33m[rgthree-comfy] ComfyUI's new Node 2.0 rendering may be incompatible with some rgthree-comfy nodes and features, breaking some rendering as well as losing the ability to access a node's properties (a vital part of many nodes). It also appears to run MUCH more slowly spiking CPU usage and causing jankiness and unresponsiveness, especially with large workflows. Personally I am not planning to use the new Nodes 2.0 and, unfortunately, am not able to invest the time to investigate and overhaul rgthree-comfy where needed. If you have issues when Nodes 2.0 is enabled, I'd urge you to switch it off as well and join me in hoping ComfyUI is not planning to deprecate the existing, stable canvas rendering all together.
+[0m
+
+STRG+C erkannt – beende ComfyUI...
+ComfyUI beendet.
